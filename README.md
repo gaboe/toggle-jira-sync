@@ -97,6 +97,28 @@ tjs config validate --config ~/.config/toggl-jira-sync/config.toml
 
 ## Daily usage
 
+Launch the TUI:
+
+```sh
+tjs
+```
+
+You can also open it explicitly:
+
+```sh
+tjs tui
+```
+
+The TUI shows recent local sync state from SQLite and lets you run common actions without leaving the terminal:
+
+- search and filter entries
+- open matching Jira or Toggl links
+- press `d` to run a dry-run sync
+- press `s` to run a real sync
+- press `a` to toggle the hourly OS scheduler
+
+While the TUI is open, it also runs an hourly in-process sync. The OS scheduler is separate and keeps hourly sync running when the TUI is not open.
+
 Run a safe preview first:
 
 ```sh
