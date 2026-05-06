@@ -8,16 +8,22 @@ This is an independent community tool. It is not an official Toggl, Jira, or Atl
 
 ## Installation
 
-From GitHub, without publishing to crates.io:
+From crates.io:
+
+```sh
+cargo install toggl-jira-sync
+```
+
+From GitHub:
 
 ```sh
 cargo install --git https://github.com/gaboe/toggle-jira-sync
 ```
 
-After publishing to crates.io:
+Update an existing Cargo install:
 
 ```sh
-cargo install toggl-jira-sync
+cargo install toggl-jira-sync --force
 ```
 
 For local development from this repository:
@@ -26,7 +32,7 @@ For local development from this repository:
 cargo run -- config setup
 ```
 
-Publishing to crates.io is optional. Use it when you want the shortest install command and versioned releases through Cargo. GitHub install works directly from the repository and is enough for private/internal use or pre-release testing.
+GitHub install works directly from the repository and is useful for testing unreleased changes. The crates.io install is the recommended stable path.
 
 ### 1. Build or run the CLI
 

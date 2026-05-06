@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+
+- Update installation docs now that the crate is published on crates.io.
+
 ## 0.1.0
 
 - Initial local Toggl to Jira sync CLI.
