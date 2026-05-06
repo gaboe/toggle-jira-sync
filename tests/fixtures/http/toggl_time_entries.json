@@ -1,0 +1,46 @@
+[
+  {
+    "id": 900001,
+    "workspace_id": 700001,
+    "project_id": 300001,
+    "description": "SAB-123 created entry",
+    "start": "2024-05-02T01:00:00Z",
+    "stop": "2024-05-02T01:30:00Z",
+    "duration": 1800,
+    "updated_at": "2024-05-02T03:06:40Z",
+    "deleted_at": null
+  },
+  {
+    "id": 900002,
+    "workspace_id": 700001,
+    "project_id": 300002,
+    "description": "BLOGIC-456 updated entry",
+    "start": "2024-05-02T02:00:00Z",
+    "stop": "2024-05-02T03:15:00Z",
+    "duration": 4500,
+    "updated_at": "2024-05-02T03:06:40Z",
+    "deleted_at": null
+  },
+  {
+    "id": 900003,
+    "workspace_id": 700001,
+    "project_id": 300003,
+    "description": "SAB-789 deleted entry",
+    "start": "2024-05-01T10:00:00Z",
+    "stop": "2024-05-01T10:20:00Z",
+    "duration": 1200,
+    "updated_at": "2024-05-02T03:06:40Z",
+    "deleted_at": "2024-05-02T03:06:40Z"
+  },
+  {
+    "id": 900004,
+    "workspace_id": 700001,
+    "project_id": 300004,
+    "description": "SAB-555 running entry",
+    "start": "2024-05-02T03:00:00Z",
+    "stop": null,
+    "duration": -1,
+    "updated_at": "2024-05-02T03:06:40Z",
+    "deleted_at": null
+  }
+]

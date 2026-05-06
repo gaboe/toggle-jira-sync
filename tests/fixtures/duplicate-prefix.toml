@@ -1,0 +1,22 @@
+[toggl]
+workspace_id = 123456
+api_token_env = "TOGGL_API_TOKEN"
+
+[runtime]
+sqlite_path = "toggl-jira-sync.sqlite"
+
+[jira]
+
+[[jira.sites]]
+key = "sabservis"
+base_url = "https://sabservis.atlassian.net"
+email_env = "SABSERVIS_JIRA_EMAIL"
+api_token_env = "SABSERVIS_JIRA_API_TOKEN"
+enabled = true
+
+[[jira.sites]]
+key = "shadow-sab"
+base_url = "https://shadow-sab.atlassian.net"
+email_env = "SHADOW_SAB_JIRA_EMAIL"
+api_token_env = "SHADOW_SAB_JIRA_API_TOKEN"
+enabled = true

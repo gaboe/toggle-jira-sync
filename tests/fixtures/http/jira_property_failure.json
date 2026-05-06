@@ -1,0 +1,7 @@
+{
+  "errorMessages": ["Property write rejected"],
+  "errors": {
+    "property": "worklog property value is invalid"
+  },
+  "status": 400
+}

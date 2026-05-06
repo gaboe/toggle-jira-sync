@@ -1,0 +1,19 @@
+{
+  "self": "http://localhost/rest/api/3/issue/SAB-123/worklog/10001",
+  "id": "10001",
+  "issueId": "20001",
+  "timeSpentSeconds": 2100,
+  "started": "2024-05-02T01:00:00.000+0000",
+  "comment": {
+    "type": "doc",
+    "version": 1,
+    "content": [
+      {
+        "type": "paragraph",
+        "content": [
+          { "type": "text", "text": "Updated from Toggl" }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,41 @@
+[package]
+name = "toggl-jira-sync"
+version = "0.1.0"
+edition = "2021"
+description = "Local Toggl to Jira worklog sync CLI with SQLite state and a Ratatui status UI"
+license = "MIT"
+repository = "https://github.com/gaboe/toggle-jira-sync"
+readme = "README.md"
+keywords = ["toggl", "jira", "cli", "ratatui", "sync"]
+categories = ["command-line-utilities"]
+exclude = [
+    "*.sqlite",
+    "*.sqlite3",
+    "credentials.env",
+    "*.credentials.env",
+    "AGENTS.md",
+    "Cargo.toml.orig",
+    ".sisyphus/**",
+]
+
+[dependencies]
+anyhow = "1.0.98"
+chrono = { version = "0.4.41", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5.38", features = ["derive"] }
+crossterm = "0.28.1"
+ratatui = { version = "0.29.0", features = ["crossterm"] }
+reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls"] }
+regex = "1.11.1"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.8"
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
+toml = "0.8.22"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+base64 = "0.22.1"
+httpmock = "0.7.0"
+tempfile = "3.19.1"

@@ -1,0 +1,15 @@
+{
+  "valid": [
+    { "description": "SAB-123 implement importer", "issue_key": "SAB-123" },
+    { "description": "BLOGIC-456 fix sync", "issue_key": "BLOGIC-456" }
+  ],
+  "ambiguous": [
+    {
+      "description": "SAB-123 and BLOGIC-456 pair debugging",
+      "issue_keys": ["SAB-123", "BLOGIC-456"]
+    }
+  ],
+  "missing": [
+    { "description": "weekly planning without ticket", "issue_keys": [] }
+  ]
+}

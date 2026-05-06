@@ -1,0 +1,29 @@
+[toggl]
+workspace_id = 123456
+api_token_env = "TOGGL_API_TOKEN"
+
+[runtime]
+sqlite_path = "toggl-jira-sync.sqlite"
+
+[jira]
+
+[[jira.sites]]
+key = "sabservis"
+base_url = "https://sabservis.atlassian.net"
+email_env = "SABSERVIS_JIRA_EMAIL"
+api_token_env = "SABSERVIS_JIRA_API_TOKEN"
+enabled = true
+
+[[jira.sites]]
+key = "blogic"
+base_url = "https://blogic.atlassian.net"
+email_env = "BLOGIC_JIRA_EMAIL"
+api_token_env = "BLOGIC_JIRA_API_TOKEN"
+enabled = true
+
+[[jira.sites]]
+key = "disabled-lab"
+base_url = "https://disabled-lab.atlassian.net"
+email_env = "DISABLED_JIRA_EMAIL"
+api_token_env = "DISABLED_JIRA_API_TOKEN"
+enabled = false

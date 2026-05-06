@@ -1,0 +1,10 @@
+/target/
+*.sqlite
+*.sqlite3
+.env
+credentials.env
+*.credentials.env
+.sisyphus/
+.sisyphus/evidence/
+AGENTS.md
+.DS_Store

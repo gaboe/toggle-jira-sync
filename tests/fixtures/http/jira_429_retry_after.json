@@ -1,0 +1,5 @@
+{
+  "errorMessages": ["Rate limit exceeded"],
+  "errors": {},
+  "status": 429
+}
