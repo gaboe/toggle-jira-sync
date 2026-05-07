@@ -104,7 +104,14 @@ async fn run_app(
         {
             let pending = pending_sync.take().expect("pending sync should exist");
             app.message = match pending.handle.join() {
-                Ok(Ok(message)) => message,
+                Ok(Ok(())) => {
+                    refresh_rows(&mut app, &db_path, limit)?;
+                    finished_sync_message(
+                        pending.label,
+                        pending.before_counts,
+                        status_counts(&app.rows),
+                    )
+                }
                 Ok(Err(error)) => {
                     format!(
                         "{} failed: {}",
@@ -114,11 +121,6 @@ async fn run_app(
                 }
                 Err(_) => format!("{} task panicked", pending.label),
             };
-            if app.message.starts_with("sync finished")
-                || app.message.starts_with("dry-run finished")
-            {
-                refresh_rows(&mut app, &db_path, limit)?;
-            }
             if !pending.dry_run {
                 next_hourly_sync = schedule_next_sync(Instant::now(), sync_interval);
             }
@@ -131,7 +133,12 @@ async fn run_app(
         terminal.draw(|frame| render(frame, &mut app))?;
         if pending_sync.is_none() && hourly_sync_due(Instant::now(), next_hourly_sync) {
             app.message = "running hourly sync...".to_owned();
-            pending_sync = Some(spawn_sync_action(sync_paths.clone(), false, "hourly sync"));
+            pending_sync = Some(spawn_sync_action(
+                sync_paths.clone(),
+                false,
+                "hourly sync",
+                status_counts(&app.rows),
+            ));
         }
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
@@ -146,8 +153,12 @@ async fn run_app(
                         TuiAction::DryRun => {
                             if pending_sync.is_none() {
                                 app.message = "running dry-run...".to_owned();
-                                pending_sync =
-                                    Some(spawn_sync_action(sync_paths.clone(), true, "dry-run"));
+                                pending_sync = Some(spawn_sync_action(
+                                    sync_paths.clone(),
+                                    true,
+                                    "dry-run",
+                                    status_counts(&app.rows),
+                                ));
                             } else {
                                 app.message = "sync already running".to_owned();
                             }
@@ -155,8 +166,12 @@ async fn run_app(
                         TuiAction::Sync => {
                             if pending_sync.is_none() {
                                 app.message = "running sync...".to_owned();
-                                pending_sync =
-                                    Some(spawn_sync_action(sync_paths.clone(), false, "sync"));
+                                pending_sync = Some(spawn_sync_action(
+                                    sync_paths.clone(),
+                                    false,
+                                    "sync",
+                                    status_counts(&app.rows),
+                                ));
                             } else {
                                 app.message = "sync already running".to_owned();
                             }
@@ -213,14 +228,21 @@ async fn run_app(
 struct PendingSync {
     label: &'static str,
     dry_run: bool,
+    before_counts: StatusCounts,
     started_at: Instant,
-    handle: thread::JoinHandle<anyhow::Result<String>>,
+    handle: thread::JoinHandle<anyhow::Result<()>>,
 }
 
-fn spawn_sync_action(paths: SharedPaths, dry_run: bool, label: &'static str) -> PendingSync {
+fn spawn_sync_action(
+    paths: SharedPaths,
+    dry_run: bool,
+    label: &'static str,
+    before_counts: StatusCounts,
+) -> PendingSync {
     PendingSync {
         label,
         dry_run,
+        before_counts,
         started_at: Instant::now(),
         handle: thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
@@ -272,19 +294,74 @@ fn status_entries(rows: Vec<StoredStatusEntry>) -> Vec<StatusEntry> {
     StatusReport::from_rows(rows).entries
 }
 
-async fn run_sync_action(paths: SharedPaths, dry_run: bool) -> anyhow::Result<String> {
+async fn run_sync_action(paths: SharedPaths, dry_run: bool) -> anyhow::Result<()> {
     crate::commands::sync::run(SyncArgs {
         paths,
         dry_run,
         json: false,
         quiet: true,
     })
-    .await?;
-    Ok(if dry_run {
-        "dry-run finished; rows refreshed".to_owned()
-    } else {
-        "sync finished; rows refreshed".to_owned()
-    })
+    .await
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StatusCounts {
+    total: usize,
+    synced: usize,
+    not_synced: usize,
+    error: usize,
+    skipped: usize,
+}
+
+fn status_counts(rows: &[TuiRow]) -> StatusCounts {
+    let mut counts = StatusCounts {
+        total: rows.len(),
+        ..StatusCounts::default()
+    };
+    for row in rows {
+        match row.status.as_str() {
+            "synced" => counts.synced += 1,
+            "not_synced" => counts.not_synced += 1,
+            "error" => counts.error += 1,
+            "skipped" => counts.skipped += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn finished_sync_message(label: &str, before: StatusCounts, after: StatusCounts) -> String {
+    let mut changes = Vec::new();
+    push_count_change(&mut changes, "synced", before.synced, after.synced);
+    push_count_change(
+        &mut changes,
+        "not_synced",
+        before.not_synced,
+        after.not_synced,
+    );
+    push_count_change(&mut changes, "error", before.error, after.error);
+    push_count_change(&mut changes, "skipped", before.skipped, after.skipped);
+
+    if changes.is_empty() && before.total == after.total {
+        return format!(
+            "{label} finished; no status changes ({after_total} rows)",
+            after_total = after.total
+        );
+    }
+
+    if before.total != after.total {
+        push_count_change(&mut changes, "rows", before.total, after.total);
+    }
+
+    format!("{label} finished; {}", changes.join(", "))
+}
+
+fn push_count_change(changes: &mut Vec<String>, label: &str, before: usize, after: usize) {
+    match (after as isize) - (before as isize) {
+        0 => {}
+        delta if delta > 0 => changes.push(format!("{label} +{delta}")),
+        delta => changes.push(format!("{label} {delta}")),
+    }
 }
 
 fn open_url(url: &str) -> io::Result<()> {
@@ -784,6 +861,45 @@ mod tests {
             app.handle_key(KeyCode::Char('a')),
             TuiAction::ToggleSchedule
         ));
+    }
+
+    #[test]
+    fn tui_finished_sync_message_shows_status_changes() {
+        let before = StatusCounts {
+            total: 2,
+            synced: 1,
+            not_synced: 1,
+            error: 0,
+            skipped: 0,
+        };
+        let after = StatusCounts {
+            total: 2,
+            synced: 2,
+            not_synced: 0,
+            error: 0,
+            skipped: 0,
+        };
+
+        assert_eq!(
+            finished_sync_message("sync", before, after),
+            "sync finished; synced +1, not_synced -1"
+        );
+    }
+
+    #[test]
+    fn tui_finished_sync_message_mentions_no_status_changes() {
+        let counts = StatusCounts {
+            total: 3,
+            synced: 2,
+            not_synced: 0,
+            error: 1,
+            skipped: 0,
+        };
+
+        assert_eq!(
+            finished_sync_message("dry-run", counts, counts),
+            "dry-run finished; no status changes (3 rows)"
+        );
     }
 
     #[test]
