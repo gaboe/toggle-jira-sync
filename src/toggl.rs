@@ -3,9 +3,10 @@ use std::{fmt, sync::Mutex, time::Duration};
 use reqwest::Url;
 use serde::Deserialize;
 
-use crate::config::AppConfig;
+use crate::{config::AppConfig, time::initial_backfill_since};
 
-const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum TogglError {
@@ -95,7 +96,7 @@ impl TogglClientConfig {
     }
 
     pub fn initial_backfill_since(&self, now_unix_seconds: i64) -> i64 {
-        start_of_utc_month(now_unix_seconds)
+        initial_backfill_since(now_unix_seconds, self.initial_backfill_days)
     }
 }
 
@@ -190,7 +191,7 @@ impl TogglClient {
         validate_base_url(&base_url)?;
 
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: toggl_http_client(),
             base_url,
             workspace_id: config.workspace_id.to_string(),
             workspace_id_raw: config.workspace_id,
@@ -214,7 +215,7 @@ impl TogglClient {
             TogglError::InvalidConfig(format!("invalid Toggl workspaces URL: {error}"))
         })?;
 
-        let raw_workspaces = reqwest::Client::new()
+        let raw_workspaces = toggl_http_client()
             .get(url)
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -295,7 +296,7 @@ impl TogglClient {
     }
 
     fn initial_backfill_since(&self, now_unix_seconds: i64) -> i64 {
-        start_of_utc_month(now_unix_seconds)
+        initial_backfill_since(now_unix_seconds, self.initial_backfill_days)
     }
 
     fn should_skip_for_pacing(&self) -> TogglResult<bool> {
@@ -352,38 +353,12 @@ fn is_localhost_url(base_url: &Url) -> bool {
     )
 }
 
-fn start_of_utc_month(unix_seconds: i64) -> i64 {
-    let days = unix_seconds.div_euclid(SECONDS_PER_DAY);
-    let (year, month, _day) = civil_from_days(days);
-    days_from_civil(year, month, 1) * SECONDS_PER_DAY
-}
-
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let days = days + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 }.div_euclid(146_097);
-    let day_of_era = days - era * 146_097;
-    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524
-        - day_of_era / 146_096)
-        .div_euclid(365);
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2).div_euclid(153);
-    let day = day_of_year - (153 * month_prime + 2).div_euclid(5) + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    let year = year + if month <= 2 { 1 } else { 0 };
-    (year, month as u32, day as u32)
-}
-
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 }.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let month = month as i64;
-    let day = day as i64;
-    let month_prime = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * month_prime + 2).div_euclid(5) + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+fn toggl_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .build()
+        .expect("Toggl HTTP client config should be valid")
 }
 
 #[derive(Debug, Deserialize)]

@@ -4,10 +4,11 @@ use std::fmt;
 use serde_json::Value;
 
 use crate::db::{Database, DbError, NewJiraWorklogLink, NewSyncAttempt};
-use crate::jira::{JiraClient, JiraError, Sleeper, TogglSyncMarker, Worklog, MARKER_PROPERTY_KEY};
+use crate::jira::{JiraClient, JiraError, MarkerVerification, Sleeper, TogglSyncMarker, Worklog};
 use crate::sync::planner::{
     PlannedCreate, PlannedDelete, PlannedMutation, PlannedUpdate, SyncPlan,
 };
+use crate::time::current_rfc3339_utc;
 
 const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -352,7 +353,7 @@ fn parse_i64(field: &'static str, value: &str) -> Result<i64, ExecutorError> {
 }
 
 fn current_timestamp() -> String {
-    "2024-05-02T03:06:40Z".to_owned()
+    current_rfc3339_utc()
 }
 
 fn comment_has_fallback_marker(worklog: &Worklog, workspace_id: &str, entry_id: &str) -> bool {
@@ -369,13 +370,24 @@ fn collect_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Array(items) => items.iter().map(collect_text).collect::<Vec<_>>().join(""),
-        Value::Object(map) => map.values().map(collect_text).collect::<Vec<_>>().join(""),
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(Value::as_str) {
+                return text.to_owned();
+            }
+            if let Some(content) = map.get("content") {
+                return collect_text(content);
+            }
+            String::new()
+        }
         _ => String::new(),
     }
 }
 
 fn is_missing_marker_lookup(error: &JiraError) -> bool {
-    matches!(error, JiraError::IssueNotFound)
+    matches!(
+        error,
+        JiraError::MarkerVerificationFailed(MarkerVerification::Missing)
+    )
 }
 
 fn is_unmanaged_worklog_error(error: &ExecutorError) -> bool {
@@ -459,9 +471,4 @@ fn record_delete_attempt(
 
 fn toggl_key(workspace_id: &str, entry_id: &str) -> (String, String) {
     (workspace_id.to_owned(), entry_id.to_owned())
-}
-
-#[allow(dead_code)]
-fn _property_key() -> &'static str {
-    MARKER_PROPERTY_KEY
 }

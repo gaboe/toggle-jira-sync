@@ -2,7 +2,9 @@ use anyhow::{anyhow, Context};
 
 use crate::{
     cli::DoctorArgs,
-    commands::config::{load_default_credentials_into_env, resolve_config_path, resolve_db_path},
+    commands::config::{
+        load_default_credentials, resolve_config_path, resolve_db_path, LocalCredentials,
+    },
     config::AppConfig,
     db::Database,
 };
@@ -12,9 +14,11 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     let config_path = resolve_config_path(args.paths.config)?;
     let config = AppConfig::from_path(&config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
-    if uses_default_config {
-        load_default_credentials_into_env()?;
-    }
+    let credentials = if uses_default_config {
+        load_default_credentials()?
+    } else {
+        LocalCredentials::default()
+    };
     let db_path = resolve_db_path(
         args.paths.db,
         &config_path,
@@ -44,10 +48,10 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
         }
     }
 
-    check_env_var(&config.toggl.api_token_env, &mut failures);
+    check_env_var(&credentials, &config.toggl.api_token_env, &mut failures);
     for site in config.enabled_jira_sites() {
-        check_env_var(&site.email_env, &mut failures);
-        check_env_var(&site.api_token_env, &mut failures);
+        check_env_var(&credentials, &site.email_env, &mut failures);
+        check_env_var(&credentials, &site.api_token_env, &mut failures);
     }
 
     println!("target sites:");
@@ -71,8 +75,8 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     }
 }
 
-fn check_env_var(name: &str, failures: &mut Vec<String>) {
-    if std::env::var_os(name).is_some() {
+fn check_env_var(credentials: &LocalCredentials, name: &str, failures: &mut Vec<String>) {
+    if credentials.contains_secret(name) {
         println!("{name}: set");
     } else {
         println!("{name}: missing");

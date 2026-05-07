@@ -2,14 +2,16 @@ use anyhow::Context;
 
 use crate::{
     cli::RecoverArgs,
-    commands::config::{load_default_credentials_into_env, resolve_config_path, resolve_db_path},
+    commands::config::{
+        load_default_credentials, resolve_config_path, resolve_db_path, LocalCredentials,
+    },
     config::AppConfig,
     db::{Database, NewSyncRun},
     jira::JiraClient,
     sync::{
         planner::{extract_issue_keys, IssueSiteMapping},
         recovery::{recover, RecoveryInput, RecoveryReport, RecoverySite},
-        resolver::{IssueSiteResolver, ResolverSite},
+        resolver::{IssueSiteResolutionError, IssueSiteResolver, ResolverSite},
     },
     toggl::{TogglClient, TogglClientConfig, TogglTimeEntry},
 };
@@ -21,9 +23,11 @@ pub async fn run(args: RecoverArgs) -> anyhow::Result<()> {
     let config_path = resolve_config_path(args.paths.config)?;
     let config = AppConfig::from_path(&config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
-    if uses_default_config {
-        load_default_credentials_into_env()?;
-    }
+    let credentials = if uses_default_config {
+        load_default_credentials()?
+    } else {
+        LocalCredentials::default()
+    };
     let db_path = resolve_db_path(
         args.paths.db,
         &config_path,
@@ -41,14 +45,13 @@ pub async fn run(args: RecoverArgs) -> anyhow::Result<()> {
         .context("failed to acquire sync lock")?;
     database
         .insert_sync_run(&NewSyncRun {
-            run_id: "recover",
+            run_id: &format!("recover-{}", current_unix_seconds()),
             mode: "recover",
             status: "running",
         })
         .context("failed to insert recovery audit row")?;
 
-    let toggl_token = std::env::var(&config.toggl.api_token_env)
-        .with_context(|| format!("missing env var {}", config.toggl.api_token_env))?;
+    let toggl_token = credentials.get_secret(&config.toggl.api_token_env)?;
     let toggl_config =
         TogglClientConfig::from_app_config(&config, toggl_token, config.toggl.base_url.clone())
             .context("failed to build Toggl client config")?;
@@ -59,10 +62,11 @@ pub async fn run(args: RecoverArgs) -> anyhow::Result<()> {
         .await
         .context("failed to fetch Toggl entries for recovery")?;
 
-    let recovery_sites = build_recovery_sites(&config)?;
-    let issue_site_mappings = resolve_issue_site_mappings(&config, &database, &fetch.entries)
-        .await
-        .context("failed to resolve Jira issue sites for recovery")?;
+    let recovery_sites = build_recovery_sites(&config, &credentials)?;
+    let issue_site_mappings =
+        resolve_issue_site_mappings(&config, &credentials, &database, &fetch.entries)
+            .await
+            .context("failed to resolve Jira issue sites for recovery")?;
     let report = recover(RecoveryInput {
         database: &database,
         entries: fetch.entries,
@@ -87,10 +91,11 @@ pub async fn run(args: RecoverArgs) -> anyhow::Result<()> {
 
 async fn resolve_issue_site_mappings(
     config: &AppConfig,
+    credentials: &LocalCredentials,
     database: &Database,
     entries: &[TogglTimeEntry],
 ) -> anyhow::Result<Vec<IssueSiteMapping>> {
-    let resolver = IssueSiteResolver::new(database, build_resolver_sites(config)?);
+    let resolver = IssueSiteResolver::new(database, build_resolver_sites(config, credentials)?);
     let mut issue_keys = entries
         .iter()
         .flat_map(|entry| extract_issue_keys(entry.description.as_deref().unwrap_or_default()))
@@ -100,20 +105,28 @@ async fn resolve_issue_site_mappings(
 
     let mut mappings = Vec::with_capacity(issue_keys.len());
     for issue_key in issue_keys {
-        mappings.push(resolver.resolve_issue_key(&issue_key).await?.into());
+        match resolver.resolve_issue_key(&issue_key).await {
+            Ok(resolved) => mappings.push(resolved.into()),
+            Err(
+                IssueSiteResolutionError::NoMatchingSite { .. }
+                | IssueSiteResolutionError::MultipleMatchingSites { .. },
+            ) => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(mappings)
 }
 
-fn build_resolver_sites(config: &AppConfig) -> anyhow::Result<Vec<ResolverSite>> {
+fn build_resolver_sites(
+    config: &AppConfig,
+    credentials: &LocalCredentials,
+) -> anyhow::Result<Vec<ResolverSite>> {
     config
         .enabled_jira_sites()
         .into_iter()
         .map(|site| {
-            let email = std::env::var(&site.email_env)
-                .with_context(|| format!("missing env var {}", site.email_env))?;
-            let token = std::env::var(&site.api_token_env)
-                .with_context(|| format!("missing env var {}", site.api_token_env))?;
+            let email = credentials.get_secret(&site.email_env)?;
+            let token = credentials.get_secret(&site.api_token_env)?;
             Ok(ResolverSite {
                 key: site.key.clone(),
                 client: JiraClient::from_credentials(site.base_url.clone(), email, token),
@@ -122,15 +135,16 @@ fn build_resolver_sites(config: &AppConfig) -> anyhow::Result<Vec<ResolverSite>>
         .collect()
 }
 
-fn build_recovery_sites(config: &AppConfig) -> anyhow::Result<Vec<RecoverySite>> {
+fn build_recovery_sites(
+    config: &AppConfig,
+    credentials: &LocalCredentials,
+) -> anyhow::Result<Vec<RecoverySite>> {
     config
         .enabled_jira_sites()
         .into_iter()
         .map(|site| {
-            let email = std::env::var(&site.email_env)
-                .with_context(|| format!("missing env var {}", site.email_env))?;
-            let token = std::env::var(&site.api_token_env)
-                .with_context(|| format!("missing env var {}", site.api_token_env))?;
+            let email = credentials.get_secret(&site.email_env)?;
+            let token = credentials.get_secret(&site.api_token_env)?;
             Ok(RecoverySite {
                 key: site.key.clone(),
                 client: JiraClient::from_credentials(site.base_url.clone(), email, token),

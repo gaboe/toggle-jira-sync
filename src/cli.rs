@@ -105,10 +105,10 @@ pub struct ScheduleSetArgs {
     #[arg(long)]
     pub interval_minutes: Option<u32>,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with = "disabled")]
     pub enabled: bool,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with = "enabled")]
     pub disabled: bool,
 }
 

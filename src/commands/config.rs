@@ -229,21 +229,40 @@ pub(crate) fn resolve_config_path(path: Option<PathBuf>) -> anyhow::Result<PathB
         .unwrap_or_else(|| default_config_dir().map(|dir| dir.join(DEFAULT_CONFIG_FILE)))
 }
 
-pub(crate) fn load_default_credentials_into_env() -> anyhow::Result<()> {
+#[derive(Debug, Default)]
+pub(crate) struct LocalCredentials {
+    values: HashMap<String, String>,
+}
+
+impl LocalCredentials {
+    pub(crate) fn get_secret(&self, name: &str) -> anyhow::Result<String> {
+        std::env::var(name)
+            .or_else(|_| {
+                self.values
+                    .get(name)
+                    .cloned()
+                    .ok_or(std::env::VarError::NotPresent)
+            })
+            .with_context(|| format!("missing env var {name}"))
+    }
+
+    pub(crate) fn contains_secret(&self, name: &str) -> bool {
+        std::env::var_os(name).is_some() || self.values.contains_key(name)
+    }
+}
+
+pub(crate) fn load_default_credentials() -> anyhow::Result<LocalCredentials> {
     let credentials_path = resolve_credentials_path(None)?;
     if !credentials_path.exists() {
-        return Ok(());
+        return Ok(LocalCredentials::default());
     }
 
-    for (name, value) in read_credentials(&credentials_path)
+    let values = read_credentials(&credentials_path)
         .with_context(|| format!("failed to read credentials {}", credentials_path.display()))?
-    {
-        if env::var_os(&name).is_none() {
-            env::set_var(name, value);
-        }
-    }
+        .into_iter()
+        .collect();
 
-    Ok(())
+    Ok(LocalCredentials { values })
 }
 
 pub(crate) fn resolve_db_path(

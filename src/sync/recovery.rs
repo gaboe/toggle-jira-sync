@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::db::{Database, DbError, NewJiraWorklogLink, NewRecoveryFinding};
-use crate::jira::{JiraClient, JiraError, Worklog};
+use crate::jira::{JiraClient, JiraError, MarkerVerification, Worklog};
 use crate::sync::planner::{
     compute_source_hash, extract_issue_keys, round_to_nearest_minute, IssueSiteMapping,
     PlannerIssue,
@@ -430,5 +430,8 @@ fn collect_text(value: &Value) -> String {
 }
 
 fn is_missing_marker_lookup(error: &JiraError) -> bool {
-    matches!(error, JiraError::IssueNotFound)
+    matches!(
+        error,
+        JiraError::MarkerVerificationFailed(MarkerVerification::Missing)
+    )
 }

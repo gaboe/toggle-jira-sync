@@ -1,13 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-use chrono::{DateTime, Local};
-
 use crate::{
     db::StoredStatusEntry,
     sync::planner::{
         plan_sync, ExistingWorklogLink, IssueSiteMapping, PlannerInput, PlannerOutcome, SkipCause,
     },
+    time::{format_duration, split_status_datetime},
     toggl::{TogglFetchResult, TogglFetchSkip},
 };
 
@@ -82,14 +81,6 @@ pub enum PlannedAction {
 }
 
 impl DryRunReport {
-    pub fn from_fetch_result(fetch: TogglFetchResult) -> Self {
-        Self::from_fetch_result_with_resolved_sites(
-            fetch,
-            default_issue_site_mappings(),
-            Vec::new(),
-        )
-    }
-
     pub fn from_fetch_result_with_resolved_sites(
         fetch: TogglFetchResult,
         issue_site_mappings: Vec<IssueSiteMapping>,
@@ -228,8 +219,8 @@ impl StatusReport {
         ]));
 
         for entry in &self.entries {
-            let (date, start) = format_status_datetime(&entry.started_at);
-            let (_, end) = format_status_datetime(&entry.stopped_at);
+            let (date, start) = split_status_datetime(&entry.started_at);
+            let (_, end) = split_status_datetime(&entry.stopped_at);
             lines.push(format_status_row(&[
                 &date,
                 &start,
@@ -264,64 +255,6 @@ fn format_status_row(columns: &[&str; 9]) -> String {
 
 fn option_or_dash(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or("-")
-}
-
-fn format_status_datetime(value: &Option<String>) -> (String, String) {
-    let Some(value) = value.as_deref() else {
-        return ("-".to_owned(), "-".to_owned());
-    };
-
-    if let Ok(datetime) = DateTime::parse_from_rfc3339(value) {
-        let local = datetime.with_timezone(&Local);
-        return (
-            local.format("%Y-%m-%d").to_string(),
-            local.format("%H:%M").to_string(),
-        );
-    }
-
-    let normalized = value.replace('T', " ");
-    let date = normalized.get(0..10).unwrap_or(value).to_owned();
-    let time = normalized
-        .get(11..16)
-        .map(str::to_owned)
-        .unwrap_or_else(|| "-".to_owned());
-
-    (date, time)
-}
-
-fn format_duration(seconds: i64) -> String {
-    if seconds <= 0 {
-        return "-".to_owned();
-    }
-
-    let minutes = (seconds + 59) / 60;
-    if minutes < 60 {
-        format!("{minutes}m")
-    } else {
-        let hours = minutes / 60;
-        let remaining_minutes = minutes % 60;
-        if remaining_minutes == 0 {
-            format!("{hours}h")
-        } else {
-            format!("{hours}h {remaining_minutes}m")
-        }
-    }
-}
-
-fn default_issue_site_mappings() -> Vec<IssueSiteMapping> {
-    [
-        ("SAB-123", "sabservis"),
-        ("SAB-555", "sabservis"),
-        ("SAB-789", "sabservis"),
-        ("BLOGIC-456", "blogic"),
-        ("OPS-789", "blogic"),
-    ]
-    .into_iter()
-    .map(|(issue_key, jira_site_key)| IssueSiteMapping {
-        issue_key: issue_key.to_owned(),
-        jira_site_key: jira_site_key.to_owned(),
-    })
-    .collect()
 }
 
 fn action_from_outcome(outcome: PlannerOutcome) -> (PlannedAction, Option<String>) {

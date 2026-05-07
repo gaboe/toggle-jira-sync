@@ -212,7 +212,7 @@ async fn toggl_client_accepts_entries_without_updated_at() {
 }
 
 #[tokio::test]
-async fn toggl_client_initial_backfill_since_starts_at_current_month() {
+async fn toggl_client_initial_backfill_since_uses_configured_days() {
     let config = AppConfig::from_toml_str(
         r#"
 [toggl]
@@ -242,12 +242,12 @@ enabled = true
 
     assert_eq!(
         toggl_config.initial_backfill_since(fixed_timestamp().unix_seconds),
-        1_714_521_600
+        fixed_timestamp().unix_seconds - 7 * 24 * 60 * 60
     );
 }
 
 #[tokio::test]
-async fn toggl_client_initial_backfill_ignores_large_config_window_for_toggl_limit_safety() {
+async fn toggl_client_initial_backfill_uses_large_config_window() {
     let config = TogglClientConfig {
         initial_backfill_days: 90,
         ..client_config("http://127.0.0.1:12345".to_owned())
@@ -255,7 +255,7 @@ async fn toggl_client_initial_backfill_ignores_large_config_window_for_toggl_lim
 
     assert_eq!(
         config.initial_backfill_since(fixed_timestamp().unix_seconds),
-        1_714_521_600
+        fixed_timestamp().unix_seconds - 90 * 24 * 60 * 60
     );
 }
 
@@ -263,7 +263,7 @@ async fn toggl_client_initial_backfill_ignores_large_config_window_for_toggl_lim
 async fn toggl_client_initial_backfill_fetch_uses_bounded_since() {
     let now = fixed_timestamp().unix_seconds;
     let server = TogglMockServer::start().await;
-    let expected_since = 1_714_521_600;
+    let expected_since = now - 90 * 24 * 60 * 60;
     let mock =
         server.mock_time_entries_since(toggl_auth("fake-toggl-token-do-not-log"), expected_since);
     let client =
@@ -282,7 +282,7 @@ async fn toggl_client_initial_backfill_fetch_uses_bounded_since() {
 async fn toggl_client_bounded_backfill_never_fetches_before_configured_window() {
     let now = fixed_timestamp().unix_seconds;
     let requested_since = now - 365 * 24 * 60 * 60;
-    let bounded_since = 1_714_521_600;
+    let bounded_since = now - 90 * 24 * 60 * 60;
     let server = TogglMockServer::start().await;
     let mock =
         server.mock_time_entries_since(toggl_auth("fake-toggl-token-do-not-log"), bounded_since);

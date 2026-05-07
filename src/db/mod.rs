@@ -223,11 +223,9 @@ impl Database {
             )?;
 
             if !already_applied {
-                self.connection.execute_batch(sql)?;
-                self.connection.execute(
-                    "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                    [version],
-                )?;
+                self.connection.execute_batch(&format!(
+                    "BEGIN IMMEDIATE;\n{sql}\nINSERT OR IGNORE INTO schema_migrations (version) VALUES ({version});\nCOMMIT;"
+                ))?;
             }
         }
 

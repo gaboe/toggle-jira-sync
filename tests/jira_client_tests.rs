@@ -480,7 +480,10 @@ async fn jira_client_honors_retry_after() {
     assert!(
         matches!(error, JiraError::RateLimited { retry_after, .. } if retry_after == Duration::from_secs(2))
     );
-    assert_eq!(sleeper.durations(), vec![Duration::from_secs(2)]);
+    assert_eq!(
+        sleeper.durations(),
+        vec![Duration::from_secs(2), Duration::from_secs(2)]
+    );
 }
 
 #[tokio::test]

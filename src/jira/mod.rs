@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const MARKER_PROPERTY_KEY: &str = "com.toggl_jira_sync";
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RATE_LIMIT_RETRIES: usize = 2;
 
 pub trait Sleeper: Clone + Send + Sync + 'static {
     fn sleep<'a>(&'a self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -200,7 +203,7 @@ impl<S: Sleeper> JiraClient<S> {
             base_url: base_url.trim_end_matches('/').to_owned(),
             email,
             api_token,
-            http: reqwest::Client::new(),
+            http: jira_http_client(),
             sleeper,
             write_pacing,
             write_pacing_state: JiraWritePacingScope::default().state,
@@ -219,7 +222,7 @@ impl<S: Sleeper> JiraClient<S> {
             base_url: base_url.trim_end_matches('/').to_owned(),
             email,
             api_token,
-            http: reqwest::Client::new(),
+            http: jira_http_client(),
             sleeper,
             write_pacing,
             write_pacing_state: write_pacing_scope.state,
@@ -291,6 +294,11 @@ impl<S: Sleeper> JiraClient<S> {
     ) -> Result<TogglSyncMarker, JiraError> {
         let url = self.property_url(issue_key, worklog_id);
         let response = self.send_with_retry(|| self.http.get(&url)).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(JiraError::MarkerVerificationFailed(
+                MarkerVerification::Missing,
+            ));
+        }
         let property = decode_success::<WorklogProperty>(response).await?;
         Ok(property.value)
     }
@@ -404,7 +412,7 @@ impl<S: Sleeper> JiraClient<S> {
     ) -> Result<(), JiraError> {
         let actual = match self.read_marker_property(issue_key, worklog_id).await {
             Ok(marker) => marker,
-            Err(JiraError::IssueNotFound) => {
+            Err(JiraError::MarkerVerificationFailed(MarkerVerification::Missing)) => {
                 self.read_comment_fallback_marker(issue_key, worklog_id)
                     .await?
             }
@@ -460,45 +468,92 @@ impl<S: Sleeper> JiraClient<S> {
         &self,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, JiraError> {
-        let response = build()
-            .basic_auth(&self.email, Some(&self.api_token))
-            .send()
-            .await?;
+        for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+            let response = build()
+                .basic_auth(&self.email, Some(&self.api_token))
+                .send()
+                .await?;
 
-        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            if response.status() != StatusCode::TOO_MANY_REQUESTS {
+                return Ok(response);
+            }
+
             let retry_after = parse_retry_after(response.headers());
             let message = response_error_text(response).await;
+            if attempt == MAX_RATE_LIMIT_RETRIES {
+                return Err(JiraError::RateLimited {
+                    retry_after,
+                    message,
+                });
+            }
             self.sleeper.sleep(retry_after).await;
-            return Err(JiraError::RateLimited {
-                retry_after,
-                message,
-            });
         }
 
-        Ok(response)
+        unreachable!("rate limit retry loop always returns")
     }
 
     fn issue_worklogs_url(&self, issue_key: &str) -> String {
-        format!("{}/rest/api/3/issue/{issue_key}/worklog", self.base_url)
+        format!(
+            "{}/rest/api/3/issue/{}/worklog",
+            self.base_url,
+            encode_path_segment(issue_key)
+        )
     }
 
     fn issue_url(&self, issue_key: &str) -> String {
-        format!("{}/rest/api/3/issue/{issue_key}", self.base_url)
+        format!(
+            "{}/rest/api/3/issue/{}",
+            self.base_url,
+            encode_path_segment(issue_key)
+        )
     }
 
     fn worklog_url(&self, issue_key: &str, worklog_id: &str) -> String {
         format!(
-            "{}/rest/api/3/issue/{issue_key}/worklog/{worklog_id}",
-            self.base_url
+            "{}/rest/api/3/issue/{}/worklog/{}",
+            self.base_url,
+            encode_path_segment(issue_key),
+            encode_path_segment(worklog_id)
         )
     }
 
     fn property_url(&self, issue_key: &str, worklog_id: &str) -> String {
         format!(
-            "{}/rest/api/3/issue/{issue_key}/worklog/{worklog_id}/properties/{MARKER_PROPERTY_KEY}",
-            self.base_url
+            "{}/rest/api/3/issue/{}/worklog/{}/properties/{MARKER_PROPERTY_KEY}",
+            self.base_url,
+            encode_path_segment(issue_key),
+            encode_path_segment(worklog_id)
         )
     }
+}
+
+fn jira_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .build()
+        .expect("Jira HTTP client config should be valid")
+}
+
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if matches!(
+            byte,
+            b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b'-'
+                | b'.'
+                | b'_'
+                | b'~'
+        ) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 #[derive(Debug, Deserialize)]

@@ -4,7 +4,9 @@ use anyhow::Context;
 
 use crate::{
     cli::SyncArgs,
-    commands::config::{load_default_credentials_into_env, resolve_config_path, resolve_db_path},
+    commands::config::{
+        load_default_credentials, resolve_config_path, resolve_db_path, LocalCredentials,
+    },
     config::{AppConfig, JiraSiteConfig},
     db::{Database, NewSyncRun, NewTogglEntry, StoredJiraWorklogLink},
     jira::{JiraClient, JiraWritePacing, JiraWritePacingScope, TokioSleeper},
@@ -17,6 +19,7 @@ use crate::{
         },
         resolver::{IssueSiteResolutionError, IssueSiteResolver, ResolverSite},
     },
+    time::{format_unix_utc, parse_rfc3339_utc},
     toggl::{TogglClient, TogglClientConfig, TogglTimeEntry},
 };
 
@@ -25,9 +28,11 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
     let uses_default_config = config_path == resolve_config_path(None)?;
     let config = AppConfig::from_path(&config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
-    if uses_default_config {
-        load_default_credentials_into_env()?;
-    }
+    let credentials = if uses_default_config {
+        load_default_credentials()?
+    } else {
+        LocalCredentials::default()
+    };
     let db_path = resolve_db_path(
         args.paths.db,
         &config_path,
@@ -52,8 +57,7 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
         })
         .context("failed to insert sync audit row")?;
 
-    let toggl_token = std::env::var(&config.toggl.api_token_env)
-        .with_context(|| format!("missing env var {}", config.toggl.api_token_env))?;
+    let toggl_token = credentials.get_secret(&config.toggl.api_token_env)?;
     let toggl_config =
         TogglClientConfig::from_app_config(&config, toggl_token, config.toggl.base_url.clone())
             .context("failed to build Toggl client config")?;
@@ -63,9 +67,10 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
         .fetch_time_entries_since(since)
         .await
         .context("failed to fetch Toggl entries")?;
-    let issue_site_mappings = resolve_issue_site_mappings(&config, &database, &fetch.entries)
-        .await
-        .context("failed to resolve Jira issue sites")?;
+    let issue_site_mappings =
+        resolve_issue_site_mappings(&config, &credentials, &database, &fetch.entries)
+            .await
+            .context("failed to resolve Jira issue sites")?;
     let existing_links = load_existing_links(&database).context("failed to load existing links")?;
 
     let plan = plan_sync(PlannerInput {
@@ -99,7 +104,7 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let report = execute_destructive_plan(&config, &plan, &database).await?;
+    let report = execute_destructive_plan(&config, &credentials, &plan, &database).await?;
 
     lock.release().context("failed to release sync lock")?;
 
@@ -129,10 +134,11 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
 
 async fn resolve_issue_site_mappings(
     config: &AppConfig,
+    credentials: &LocalCredentials,
     database: &Database,
     entries: &[TogglTimeEntry],
 ) -> anyhow::Result<Vec<IssueSiteMapping>> {
-    let resolver = IssueSiteResolver::new(database, build_resolver_sites(config)?);
+    let resolver = IssueSiteResolver::new(database, build_resolver_sites(config, credentials)?);
     let mut issue_keys = entries
         .iter()
         .flat_map(|entry| extract_issue_keys(entry.description.as_deref().unwrap_or_default()))
@@ -154,15 +160,16 @@ async fn resolve_issue_site_mappings(
     Ok(mappings)
 }
 
-fn build_resolver_sites(config: &AppConfig) -> anyhow::Result<Vec<ResolverSite>> {
+fn build_resolver_sites(
+    config: &AppConfig,
+    credentials: &LocalCredentials,
+) -> anyhow::Result<Vec<ResolverSite>> {
     config
         .enabled_jira_sites()
         .into_iter()
         .map(|site| {
-            let email = std::env::var(&site.email_env)
-                .with_context(|| format!("missing env var {}", site.email_env))?;
-            let token = std::env::var(&site.api_token_env)
-                .with_context(|| format!("missing env var {}", site.api_token_env))?;
+            let email = credentials.get_secret(&site.email_env)?;
+            let token = credentials.get_secret(&site.api_token_env)?;
             Ok(ResolverSite {
                 key: site.key.clone(),
                 client: JiraClient::from_credentials(site.base_url.clone(), email, token),
@@ -365,61 +372,6 @@ fn stopped_at(entry: &TogglTimeEntry) -> Option<String> {
     Some(format_unix_utc(timestamp))
 }
 
-fn parse_rfc3339_utc(value: &str) -> Option<i64> {
-    let value = value
-        .strip_suffix('Z')
-        .or_else(|| value.strip_suffix("+00:00"))?;
-    let (date, time) = value.split_once('T')?;
-    let mut date_parts = date.split('-');
-    let year = date_parts.next()?.parse::<i64>().ok()?;
-    let month = date_parts.next()?.parse::<u32>().ok()?;
-    let day = date_parts.next()?.parse::<u32>().ok()?;
-    let time = time.split('.').next()?;
-    let mut time_parts = time.split(':');
-    let hour = time_parts.next()?.parse::<i64>().ok()?;
-    let minute = time_parts.next()?.parse::<i64>().ok()?;
-    let second = time_parts.next()?.parse::<i64>().ok()?;
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
-}
-
-fn format_unix_utc(timestamp: i64) -> String {
-    let days = timestamp.div_euclid(86_400);
-    let seconds_of_day = timestamp.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = seconds_of_day / 3_600;
-    let minute = (seconds_of_day % 3_600) / 60;
-    let second = seconds_of_day % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let days = days + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 }.div_euclid(146_097);
-    let day_of_era = days - era * 146_097;
-    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524
-        - day_of_era / 146_096)
-        .div_euclid(365);
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2).div_euclid(153);
-    let day = day_of_year - (153 * month_prime + 2).div_euclid(5) + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    let year = year + if month <= 2 { 1 } else { 0 };
-    (year, month as u32, day as u32)
-}
-
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 }.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let month = month as i64;
-    let day = day as i64;
-    let month_prime = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * month_prime + 2).div_euclid(5) + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
-
 fn fallback_source_hash(entry: &TogglTimeEntry) -> String {
     format!(
         "sha256:local:{}:{}:{}",
@@ -436,6 +388,7 @@ fn rounded_duration(entry: &TogglTimeEntry) -> i64 {
 
 async fn execute_destructive_plan(
     config: &AppConfig,
+    credentials: &LocalCredentials,
     plan: &SyncPlan,
     database: &Database,
 ) -> anyhow::Result<ExecutorReport> {
@@ -446,7 +399,7 @@ async fn execute_destructive_plan(
         if site_plan.mutations.is_empty() {
             continue;
         }
-        let client = jira_client_for_site(config, site, write_pacing_scope.clone())?;
+        let client = jira_client_for_site(config, credentials, site, write_pacing_scope.clone())?;
         let report = execute_plan(&site_plan, &client, database, ExecutorOptions::default())
             .await
             .with_context(|| format!("failed to execute Jira sync for site {}", site.key))?;
@@ -480,13 +433,12 @@ fn mutation_site_key(mutation: &PlannedMutation) -> &str {
 
 fn jira_client_for_site(
     config: &AppConfig,
+    credentials: &LocalCredentials,
     site: &JiraSiteConfig,
     write_pacing_scope: JiraWritePacingScope,
 ) -> anyhow::Result<JiraClient<TokioSleeper>> {
-    let email = std::env::var(&site.email_env)
-        .with_context(|| format!("missing env var {}", site.email_env))?;
-    let api_token = std::env::var(&site.api_token_env)
-        .with_context(|| format!("missing env var {}", site.api_token_env))?;
+    let email = credentials.get_secret(&site.email_env)?;
+    let api_token = credentials.get_secret(&site.api_token_env)?;
     Ok(JiraClient::new_with_pacing_scope(
         site.base_url.clone(),
         email,

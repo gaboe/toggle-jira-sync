@@ -10,6 +10,7 @@ use support::{fixture_text, temp_db, toggl_auth, FixtureName};
 use toggl_jira_sync::{
     db::{Database, NewJiraIssueSiteCache, NewJiraWorklogLink},
     report::{DryRunReport, PlannedAction},
+    sync::planner::IssueSiteMapping,
     toggl::{SkipReason, TogglFetchResult, TogglTimeEntry},
 };
 
@@ -128,41 +129,58 @@ fn seed_issue_site_cache(db_path: &std::path::Path) {
 
 #[test]
 fn dry_run_outputs_parseable_json_report() {
-    let report = DryRunReport::from_fetch_result(TogglFetchResult {
-        entries: vec![
-            TogglTimeEntry {
-                workspace_id: "700001".to_owned(),
-                entry_id: "900001".to_owned(),
-                start: "2024-05-02T01:00:00Z".to_owned(),
-                duration_seconds: 1800,
-                description: Some("SAB-123 created entry".to_owned()),
-                updated_at: "2024-05-02T03:06:40Z".to_owned(),
-                deleted_at: None,
-                skip_reason: None,
+    let report = DryRunReport::from_fetch_result_with_resolved_sites(
+        TogglFetchResult {
+            entries: vec![
+                TogglTimeEntry {
+                    workspace_id: "700001".to_owned(),
+                    entry_id: "900001".to_owned(),
+                    start: "2024-05-02T01:00:00Z".to_owned(),
+                    duration_seconds: 1800,
+                    description: Some("SAB-123 created entry".to_owned()),
+                    updated_at: "2024-05-02T03:06:40Z".to_owned(),
+                    deleted_at: None,
+                    skip_reason: None,
+                },
+                TogglTimeEntry {
+                    workspace_id: "700001".to_owned(),
+                    entry_id: "900003".to_owned(),
+                    start: "2024-05-01T10:00:00Z".to_owned(),
+                    duration_seconds: 1200,
+                    description: Some("SAB-789 deleted entry".to_owned()),
+                    updated_at: "2024-05-02T03:06:40Z".to_owned(),
+                    deleted_at: Some("2024-05-02T03:06:40Z".to_owned()),
+                    skip_reason: None,
+                },
+                TogglTimeEntry {
+                    workspace_id: "700001".to_owned(),
+                    entry_id: "900004".to_owned(),
+                    start: "2024-05-02T03:00:00Z".to_owned(),
+                    duration_seconds: -1,
+                    description: Some("SAB-555 running entry".to_owned()),
+                    updated_at: "2024-05-02T03:06:40Z".to_owned(),
+                    deleted_at: None,
+                    skip_reason: Some(SkipReason::RunningEntry),
+                },
+            ],
+            skipped: Vec::new(),
+        },
+        vec![
+            IssueSiteMapping {
+                issue_key: "SAB-123".to_owned(),
+                jira_site_key: "sabservis".to_owned(),
             },
-            TogglTimeEntry {
-                workspace_id: "700001".to_owned(),
-                entry_id: "900003".to_owned(),
-                start: "2024-05-01T10:00:00Z".to_owned(),
-                duration_seconds: 1200,
-                description: Some("SAB-789 deleted entry".to_owned()),
-                updated_at: "2024-05-02T03:06:40Z".to_owned(),
-                deleted_at: Some("2024-05-02T03:06:40Z".to_owned()),
-                skip_reason: None,
+            IssueSiteMapping {
+                issue_key: "SAB-555".to_owned(),
+                jira_site_key: "sabservis".to_owned(),
             },
-            TogglTimeEntry {
-                workspace_id: "700001".to_owned(),
-                entry_id: "900004".to_owned(),
-                start: "2024-05-02T03:00:00Z".to_owned(),
-                duration_seconds: -1,
-                description: Some("SAB-555 running entry".to_owned()),
-                updated_at: "2024-05-02T03:06:40Z".to_owned(),
-                deleted_at: None,
-                skip_reason: Some(SkipReason::RunningEntry),
+            IssueSiteMapping {
+                issue_key: "SAB-789".to_owned(),
+                jira_site_key: "sabservis".to_owned(),
             },
         ],
-        skipped: Vec::new(),
-    });
+        Vec::new(),
+    );
 
     let json = report.to_json_string().expect("report should serialize");
     let parsed: Value = serde_json::from_str(&json).expect("report JSON should parse");
@@ -186,19 +204,32 @@ fn dry_run_outputs_parseable_json_report() {
 
 #[test]
 fn dry_run_reports_multiple_issue_keys_as_error_without_mutation_action() {
-    let report = DryRunReport::from_fetch_result(TogglFetchResult {
-        entries: vec![TogglTimeEntry {
-            workspace_id: "700001".to_owned(),
-            entry_id: "900009".to_owned(),
-            start: "2024-05-02T01:00:00Z".to_owned(),
-            duration_seconds: 1800,
-            description: Some("SAB-123 and BLOGIC-456 conflict".to_owned()),
-            updated_at: "2024-05-02T03:06:40Z".to_owned(),
-            deleted_at: None,
-            skip_reason: None,
-        }],
-        skipped: Vec::new(),
-    });
+    let report = DryRunReport::from_fetch_result_with_resolved_sites(
+        TogglFetchResult {
+            entries: vec![TogglTimeEntry {
+                workspace_id: "700001".to_owned(),
+                entry_id: "900009".to_owned(),
+                start: "2024-05-02T01:00:00Z".to_owned(),
+                duration_seconds: 1800,
+                description: Some("SAB-123 and BLOGIC-456 conflict".to_owned()),
+                updated_at: "2024-05-02T03:06:40Z".to_owned(),
+                deleted_at: None,
+                skip_reason: None,
+            }],
+            skipped: Vec::new(),
+        },
+        vec![
+            IssueSiteMapping {
+                issue_key: "SAB-123".to_owned(),
+                jira_site_key: "sabservis".to_owned(),
+            },
+            IssueSiteMapping {
+                issue_key: "BLOGIC-456".to_owned(),
+                jira_site_key: "blogic".to_owned(),
+            },
+        ],
+        Vec::new(),
+    );
 
     assert_eq!(report.summary.errors_count, 1);
     assert_eq!(report.entries[0].action, PlannedAction::Error);

@@ -5,6 +5,7 @@ pub mod db;
 pub mod jira;
 pub mod report;
 pub mod sync;
+pub mod time;
 pub mod toggl;
 
 pub async fn run(cli: cli::Cli) -> anyhow::Result<()> {

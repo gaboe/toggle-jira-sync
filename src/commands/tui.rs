@@ -3,11 +3,11 @@ use std::{
     io,
     io::IsTerminal,
     process::Command,
+    thread,
     time::{Duration, Instant},
 };
 
 use anyhow::Context;
-use chrono::{DateTime, Local};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::{Constraint, Layout},
@@ -26,6 +26,7 @@ use crate::{
     config::AppConfig,
     db::{Database, StoredStatusEntry},
     report::{StatusEntry, StatusReport},
+    time::{format_duration, split_status_datetime},
 };
 
 pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
@@ -93,19 +94,33 @@ async fn run_app(
 ) -> anyhow::Result<()> {
     let sync_interval = Duration::from_secs(60 * 60);
     let mut next_hourly_sync = schedule_next_sync(Instant::now(), sync_interval);
+    let mut pending_sync: Option<PendingSync> = None;
 
     while !app.quit {
-        terminal.draw(|frame| render(frame, &mut app))?;
-        if hourly_sync_due(Instant::now(), next_hourly_sync) {
-            app.message = "running hourly sync...".to_owned();
-            terminal.draw(|frame| render(frame, &mut app))?;
-            app.message = run_sync_action(sync_paths.clone(), false)
-                .await
-                .unwrap_or_else(|error| format!("hourly sync failed: {error}"));
-            if app.message.starts_with("sync finished") {
+        if pending_sync
+            .as_ref()
+            .is_some_and(|pending| pending.handle.is_finished())
+        {
+            let pending = pending_sync.take().expect("pending sync should exist");
+            app.message = match pending.handle.join() {
+                Ok(Ok(message)) => message,
+                Ok(Err(error)) => format!("{} failed: {error}", pending.label),
+                Err(_) => format!("{} task panicked", pending.label),
+            };
+            if app.message.starts_with("sync finished")
+                || app.message.starts_with("dry-run finished")
+            {
                 refresh_rows(&mut app, &db_path, limit)?;
             }
-            next_hourly_sync = schedule_next_sync(Instant::now(), sync_interval);
+            if !pending.dry_run {
+                next_hourly_sync = schedule_next_sync(Instant::now(), sync_interval);
+            }
+        }
+
+        terminal.draw(|frame| render(frame, &mut app))?;
+        if pending_sync.is_none() && hourly_sync_due(Instant::now(), next_hourly_sync) {
+            app.message = "running hourly sync...".to_owned();
+            pending_sync = Some(spawn_sync_action(sync_paths.clone(), false, "hourly sync"));
         }
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
@@ -118,25 +133,22 @@ async fn run_app(
                                 .unwrap_or_else(|error| format!("open failed: {error}"));
                         }
                         TuiAction::DryRun => {
-                            app.message = "running dry-run...".to_owned();
-                            terminal.draw(|frame| render(frame, &mut app))?;
-                            app.message = run_sync_action(sync_paths.clone(), true)
-                                .await
-                                .unwrap_or_else(|error| format!("dry-run failed: {error}"));
-                            if app.message.starts_with("dry-run finished") {
-                                refresh_rows(&mut app, &db_path, limit)?;
+                            if pending_sync.is_none() {
+                                app.message = "running dry-run...".to_owned();
+                                pending_sync =
+                                    Some(spawn_sync_action(sync_paths.clone(), true, "dry-run"));
+                            } else {
+                                app.message = "sync already running".to_owned();
                             }
                         }
                         TuiAction::Sync => {
-                            app.message = "running sync...".to_owned();
-                            terminal.draw(|frame| render(frame, &mut app))?;
-                            app.message = run_sync_action(sync_paths.clone(), false)
-                                .await
-                                .unwrap_or_else(|error| format!("sync failed: {error}"));
-                            if app.message.starts_with("sync finished") {
-                                refresh_rows(&mut app, &db_path, limit)?;
+                            if pending_sync.is_none() {
+                                app.message = "running sync...".to_owned();
+                                pending_sync =
+                                    Some(spawn_sync_action(sync_paths.clone(), false, "sync"));
+                            } else {
+                                app.message = "sync already running".to_owned();
                             }
-                            next_hourly_sync = schedule_next_sync(Instant::now(), sync_interval);
                         }
                         TuiAction::ToggleSchedule => {
                             let enabled = !app.schedule_enabled;
@@ -185,6 +197,26 @@ async fn run_app(
         }
     }
     Ok(())
+}
+
+struct PendingSync {
+    label: &'static str,
+    dry_run: bool,
+    handle: thread::JoinHandle<anyhow::Result<String>>,
+}
+
+fn spawn_sync_action(paths: SharedPaths, dry_run: bool, label: &'static str) -> PendingSync {
+    PendingSync {
+        label,
+        dry_run,
+        handle: thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to start sync runtime")?
+                .block_on(run_sync_action(paths, dry_run))
+        }),
+    }
 }
 
 fn schedule_next_sync(now: Instant, interval: Duration) -> Instant {
@@ -434,8 +466,8 @@ impl TuiApp {
 
 impl TuiRow {
     fn from_status(entry: StatusEntry, base_urls: &HashMap<String, String>) -> Self {
-        let (date, start) = split_datetime(&entry.started_at);
-        let (_, end) = split_datetime(&entry.stopped_at);
+        let (date, start) = split_status_datetime(&entry.started_at);
+        let (_, end) = split_status_datetime(&entry.stopped_at);
         let issue = entry.issue_key.unwrap_or_else(|| "-".to_owned());
         let site = entry.site.unwrap_or_else(|| "-".to_owned());
         let worklog = entry.worklog_id.unwrap_or_else(|| "-".to_owned());
@@ -600,37 +632,6 @@ fn empty_or_dash(value: &str) -> &str {
         "-"
     } else {
         value
-    }
-}
-
-fn split_datetime(value: &Option<String>) -> (String, String) {
-    let Some(value) = value.as_deref() else {
-        return ("-".to_owned(), "-".to_owned());
-    };
-    if let Ok(datetime) = DateTime::parse_from_rfc3339(value) {
-        let local = datetime.with_timezone(&Local);
-        return (
-            local.format("%Y-%m-%d").to_string(),
-            local.format("%H:%M").to_string(),
-        );
-    }
-    (
-        value.get(0..10).unwrap_or("-").to_owned(),
-        value.get(11..16).unwrap_or("-").to_owned(),
-    )
-}
-
-fn format_duration(seconds: i64) -> String {
-    if seconds <= 0 {
-        return "-".to_owned();
-    }
-    let minutes = (seconds + 59) / 60;
-    if minutes < 60 {
-        format!("{minutes}m")
-    } else if minutes % 60 == 0 {
-        format!("{}h", minutes / 60)
-    } else {
-        format!("{}h {}m", minutes / 60, minutes % 60)
     }
 }
 
