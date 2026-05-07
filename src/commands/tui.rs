@@ -123,6 +123,10 @@ async fn run_app(
             }
         }
 
+        if let Some(pending) = &pending_sync {
+            app.message = sync_progress_message(pending, Instant::now());
+        }
+
         terminal.draw(|frame| render(frame, &mut app))?;
         if pending_sync.is_none() && hourly_sync_due(Instant::now(), next_hourly_sync) {
             app.message = "running hourly sync...".to_owned();
@@ -208,6 +212,7 @@ async fn run_app(
 struct PendingSync {
     label: &'static str,
     dry_run: bool,
+    started_at: Instant,
     handle: thread::JoinHandle<anyhow::Result<String>>,
 }
 
@@ -215,6 +220,7 @@ fn spawn_sync_action(paths: SharedPaths, dry_run: bool, label: &'static str) -> 
     PendingSync {
         label,
         dry_run,
+        started_at: Instant::now(),
         handle: thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -223,6 +229,24 @@ fn spawn_sync_action(paths: SharedPaths, dry_run: bool, label: &'static str) -> 
                 .block_on(run_sync_action(paths, dry_run))
         }),
     }
+}
+
+fn sync_progress_message(pending: &PendingSync, now: Instant) -> String {
+    let elapsed = now.saturating_duration_since(pending.started_at);
+    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let frame = spinner[((elapsed.as_millis() / 120) as usize) % spinner.len()];
+    let seconds = elapsed.as_secs();
+    let action = if pending.dry_run {
+        "planning changes"
+    } else {
+        "fetching Toggl, resolving Jira, writing worklogs"
+    };
+    format!(
+        "{frame} {} running {:02}:{:02} · {action} · keep working or press q after it finishes",
+        pending.label,
+        seconds / 60,
+        seconds % 60
+    )
 }
 
 fn schedule_next_sync(now: Instant, interval: Duration) -> Instant {
