@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.5
+
+- Start default initial sync at the first day of the current month so older completed Toggl entries are not pulled into a new install.
+
 ## 0.1.4
 
 - Cap Toggl initial backfill to a safe API window so sync does not fail with `Since cannot be older than 3 months`.
