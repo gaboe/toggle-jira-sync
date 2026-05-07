@@ -117,6 +117,22 @@ The TUI shows recent local sync state from SQLite and lets you run common action
 - press `s` to run a real sync
 - press `a` to toggle the hourly OS scheduler
 
+It is the main day-to-day view:
+
+```text
+Toggl -> Jira Sync TUI  normal
+Issue search: - | Date/time filter: - | rows=3/3 | OS schedule: on every 60m
+
+date        start end   duration   issue    site     worklog status  reason
+2026-05-04 15:59 17:43 1h 44m     PROJ-123 acme     26410   synced  -
+2026-05-04 18:00 18:30 30m        PROJ-456 acme     -       skipped running entry
+2026-05-05 09:15 10:00 45m        PROJ-789 acme     -       error   issue not found
+
+Issue: PROJ-123 | Worklog: 26410 | Reason: -
+Issue URL: https://acme.atlassian.net/browse/PROJ-123
+Worklog URL: https://acme.atlassian.net/browse/PROJ-123?focusedWorklogId=26410
+```
+
 While the TUI is open, it also runs an hourly in-process sync. The OS scheduler is separate and keeps hourly sync running when the TUI is not open.
 
 Run a safe preview first:
@@ -154,7 +170,7 @@ tjs schedule uninstall
 
 ## How Jira site resolution works
 
-For each Toggl entry, the CLI extracts a Jira issue key from the description, for example `SAB-123`.
+For each Toggl entry, the CLI extracts a Jira issue key from the description, for example `PROJ-123`.
 
 Resolution flow:
 
@@ -175,11 +191,3 @@ toggl-jira-sync.sqlite
 ```
 
 `credentials.env` stores raw local credentials and is written with user-only permissions on Unix/macOS.
-
-## Safety
-
-- Do not commit real Toggl or Jira tokens.
-- Rotate tokens if they were pasted into chat, logs, or git by mistake.
-- Use `sync --dry-run` before the first real sync.
-- Use `status` and `recover` to inspect and repair local state.
-- This tool writes Jira worklogs; verify your Toggl descriptions and Jira issue keys before enabling scheduled sync.
