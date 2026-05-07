@@ -16,6 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
     DefaultTerminal, Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     cli::{SharedPaths, SyncArgs, TuiArgs},
@@ -586,6 +587,24 @@ fn render(frame: &mut Frame<'_>, app: &mut TuiApp) {
                 Cell::from(reason_span(&row.reason)),
             ])
         });
+    let site_width = app
+        .visible
+        .iter()
+        .filter_map(|index| app.rows.get(*index))
+        .map(|row| row.site.width())
+        .max()
+        .unwrap_or("site".width())
+        .max("site".width())
+        .clamp(8, 16) as u16;
+    let status_width = app
+        .visible
+        .iter()
+        .filter_map(|index| app.rows.get(*index))
+        .map(|row| row.status.width())
+        .max()
+        .unwrap_or("status".width())
+        .max("status".width())
+        .clamp(7, 12) as u16;
     let mut state = TableState::default().with_selected(Some(app.selected));
     let table = Table::new(
         rows,
@@ -595,9 +614,9 @@ fn render(frame: &mut Frame<'_>, app: &mut TuiApp) {
             Constraint::Length(5),
             Constraint::Length(10),
             Constraint::Length(8),
-            Constraint::Length(8),
+            Constraint::Length(site_width),
             Constraint::Length(7),
-            Constraint::Length(7),
+            Constraint::Length(status_width),
             Constraint::Min(8),
         ],
     )

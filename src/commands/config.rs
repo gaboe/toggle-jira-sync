@@ -20,6 +20,8 @@ use crate::{
 const TOGGL_API_TOKEN_ENV: &str = "TOGGL_API_TOKEN";
 const TOGGL_DEFAULT_BASE_URL: &str = "https://api.track.toggl.com";
 const DEFAULT_CONFIG_DIR: &str = ".config/toggl-jira-sync";
+#[cfg(windows)]
+const DEFAULT_WINDOWS_CONFIG_DIR: &str = "toggl-jira-sync";
 const DEFAULT_CONFIG_FILE: &str = "config.toml";
 const DEFAULT_CREDENTIALS_FILE: &str = "credentials.env";
 const DEFAULT_SQLITE_PATH: &str = "toggl-jira-sync.sqlite";
@@ -295,9 +297,27 @@ fn resolve_credentials_path(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 }
 
 fn default_config_dir() -> anyhow::Result<PathBuf> {
-    let home = env::var_os("HOME")
-        .ok_or_else(|| anyhow!("HOME must be set to resolve default config paths"))?;
-    Ok(PathBuf::from(home).join(DEFAULT_CONFIG_DIR))
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = env::var_os("APPDATA") {
+            return Ok(PathBuf::from(appdata).join(DEFAULT_WINDOWS_CONFIG_DIR));
+        }
+        if let Some(user_profile) = env::var_os("USERPROFILE") {
+            return Ok(PathBuf::from(user_profile)
+                .join("AppData")
+                .join("Roaming")
+                .join(DEFAULT_WINDOWS_CONFIG_DIR));
+        }
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join(DEFAULT_CONFIG_DIR));
+    }
+
+    #[cfg(windows)]
+    bail!("APPDATA, USERPROFILE, or HOME must be set to resolve default config paths");
+    #[cfg(not(windows))]
+    bail!("HOME must be set to resolve default config paths");
 }
 
 fn read_required(prompt: &str) -> anyhow::Result<String> {

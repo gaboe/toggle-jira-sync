@@ -1,6 +1,6 @@
 [package]
 name = "toggl-jira-sync"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "Local Toggl to Jira worklog sync CLI with SQLite state and a Ratatui status UI"
 license = "MIT"
@@ -35,6 +35,7 @@ tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
 toml = "0.8.22"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+unicode-width = "0.2.0"
 
 [dev-dependencies]
 base64 = "0.22.1"

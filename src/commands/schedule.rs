@@ -149,6 +149,17 @@ fn load_job(path: &Path) -> anyhow::Result<()> {
             bail!("launchctl load failed for {}", path.display());
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("cmd")
+            .arg("/C")
+            .arg(path)
+            .output()
+            .with_context(|| format!("failed to run {}", path.display()))?;
+        if !output.status.success() {
+            bail!("schtasks create failed for {}", path.display());
+        }
+    }
     Ok(())
 }
 
@@ -156,6 +167,16 @@ fn unload_job(path: &Path) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let _ = quiet_launchctl("unload", path);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("schtasks")
+            .args(["/Delete", "/F", "/TN", JOB_NAME])
+            .output()
+            .context("failed to run schtasks delete")?;
+        if !output.status.success() && path.exists() {
+            bail!("schtasks delete failed for {JOB_NAME}");
+        }
     }
     Ok(())
 }
