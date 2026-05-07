@@ -104,7 +104,13 @@ async fn run_app(
             let pending = pending_sync.take().expect("pending sync should exist");
             app.message = match pending.handle.join() {
                 Ok(Ok(message)) => message,
-                Ok(Err(error)) => format!("{} failed: {error}", pending.label),
+                Ok(Err(error)) => {
+                    format!(
+                        "{} failed: {}",
+                        pending.label,
+                        crate::format_error_chain(&error).replace('\n', " | ")
+                    )
+                }
                 Err(_) => format!("{} task panicked", pending.label),
             };
             if app.message.starts_with("sync finished")

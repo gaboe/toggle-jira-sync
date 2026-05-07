@@ -1,13 +1,15 @@
 use chrono::{DateTime, Local, SecondsFormat, TimeZone, Utc};
 
 pub const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+const TOGGL_MAX_BACKFILL_DAYS: u32 = 85;
 
 pub fn current_rfc3339_utc() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 pub fn initial_backfill_since(now_unix_seconds: i64, initial_backfill_days: u32) -> i64 {
-    now_unix_seconds.saturating_sub(i64::from(initial_backfill_days) * SECONDS_PER_DAY)
+    let bounded_days = initial_backfill_days.min(TOGGL_MAX_BACKFILL_DAYS);
+    now_unix_seconds.saturating_sub(i64::from(bounded_days) * SECONDS_PER_DAY)
 }
 
 pub fn parse_rfc3339_utc(value: &str) -> Option<i64> {

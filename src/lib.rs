@@ -29,3 +29,16 @@ pub async fn run(cli: cli::Cli) -> anyhow::Result<()> {
         }
     }
 }
+
+pub fn format_error_chain(error: &anyhow::Error) -> String {
+    let mut lines = Vec::new();
+
+    for cause in error.chain() {
+        let line = cause.to_string();
+        if lines.last() != Some(&line) {
+            lines.push(line);
+        }
+    }
+
+    lines.join("\n")
+}

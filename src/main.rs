@@ -10,7 +10,7 @@ async fn main() -> ExitCode {
     match toggl_jira_sync::run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{}", format_error_chain(&error));
+            eprintln!("{}", toggl_jira_sync::format_error_chain(&error));
             ExitCode::FAILURE
         }
     }
@@ -22,17 +22,4 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .init();
-}
-
-fn format_error_chain(error: &anyhow::Error) -> String {
-    let mut lines = Vec::new();
-
-    for cause in error.chain() {
-        let line = cause.to_string();
-        if lines.last() != Some(&line) {
-            lines.push(line);
-        }
-    }
-
-    lines.join("\n")
 }
