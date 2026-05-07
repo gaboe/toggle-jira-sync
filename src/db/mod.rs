@@ -497,7 +497,7 @@ impl Database {
                     WHEN link.status = 'error' THEN 'jira worklog link is marked error'
                     WHEN link.jira_worklog_id IS NOT NULL AND link.status IN ('created', 'updated') THEN NULL
                     WHEN entry.rounded_duration_seconds = 0 AND entry.stopped_at IS NULL THEN 'running entry'
-                    WHEN entry.extracted_issue_key IS NULL THEN 'missing issue key'
+                    WHEN entry.extracted_issue_key IS NULL THEN 'no valid Jira issue key found in Toggl description'
                     WHEN entry.rounded_duration_seconds = 0 THEN 'rounded duration is zero'
                     ELSE NULL
                 END AS reason

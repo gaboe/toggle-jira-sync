@@ -133,6 +133,10 @@ pub(crate) fn uninstall_job() -> anyhow::Result<()> {
 }
 
 fn load_job(path: &Path) -> anyhow::Result<()> {
+    if env::var_os("TOGGL_JIRA_SYNC_SKIP_SCHEDULER_LOAD").is_some() {
+        return Ok(());
+    }
+
     #[cfg(target_os = "macos")]
     {
         let _ = quiet_launchctl("unload", path);

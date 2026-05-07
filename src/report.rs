@@ -350,7 +350,9 @@ fn action_from_outcome(outcome: PlannerOutcome) -> (PlannedAction, Option<String
 
 fn skip_reason(cause: SkipCause) -> String {
     match cause {
-        SkipCause::MissingIssueKey => "missing issue key".to_owned(),
+        SkipCause::MissingIssueKey => {
+            "no valid Jira issue key found in Toggl description".to_owned()
+        }
         SkipCause::RoundedDurationZero => "rounded duration is zero".to_owned(),
         SkipCause::RunningEntry => "running entry".to_owned(),
         SkipCause::MissingManagedWorklog => "missing managed Jira worklog".to_owned(),

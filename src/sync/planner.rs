@@ -130,13 +130,13 @@ impl fmt::Display for PlannerIssue {
             Self::UnresolvedIssueSite { issue_key } => {
                 write!(
                     formatter,
-                    "Jira site for issue key {issue_key} is not resolved"
+                    "Jira issue {issue_key} was not found on any enabled Jira site"
                 )
             }
             Self::AmbiguousIssueSite { issue_key } => {
                 write!(
                     formatter,
-                    "Jira site for issue key {issue_key} is ambiguous"
+                    "Jira issue {issue_key} exists on multiple enabled Jira sites"
                 )
             }
         }

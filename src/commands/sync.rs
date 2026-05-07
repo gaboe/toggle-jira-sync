@@ -44,7 +44,7 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
     let lock = database
         .acquire_sync_lock(mode)
         .context("failed to acquire sync lock")?;
-    database
+    let sync_run_id = database
         .insert_sync_run(&NewSyncRun {
             run_id: &format!("{mode}-{}", current_unix_seconds()),
             mode,
@@ -74,7 +74,7 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
         existing_links: existing_links.clone(),
     })
     .expect("planner does not fail globally");
-    record_toggl_entry_ledgers(&database, &fetch.entries, &plan)
+    record_toggl_entry_ledgers(&database, sync_run_id, &fetch.entries, &plan)
         .context("failed to upsert Toggl entry ledger rows")?;
 
     if args.dry_run {
@@ -193,6 +193,7 @@ fn existing_link_from_stored(link: StoredJiraWorklogLink) -> Option<ExistingWork
 
 fn record_toggl_entry_ledgers(
     database: &Database,
+    sync_run_id: i64,
     entries: &[TogglTimeEntry],
     plan: &SyncPlan,
 ) -> anyhow::Result<()> {
@@ -255,7 +256,8 @@ fn record_toggl_entry_ledgers(
             .get(&key)
             .cloned()
             .unwrap_or_else(|| (None, fallback_source_hash(entry), rounded_duration(entry)));
-        let status = match outcomes.get(&key) {
+        let outcome = outcomes.get(&key);
+        let status = match outcome {
             Some(PlannerOutcome::Error(_)) => "error",
             _ => "planned",
         };
@@ -271,9 +273,70 @@ fn record_toggl_entry_ledgers(
             started_at: Some(&entry.start),
             stopped_at: stopped_at(entry).as_deref(),
         })?;
+
+        if let Some(PlannerOutcome::Error(issue)) = outcome {
+            let attempt_issue_key = planner_issue_key(issue);
+            database.insert_sync_attempt(&crate::db::NewSyncAttempt {
+                sync_run_id: Some(sync_run_id),
+                toggl_workspace_id: &entry.workspace_id,
+                toggl_entry_id: &entry.entry_id,
+                jira_site_key: None,
+                jira_issue_key: attempt_issue_key,
+                jira_worklog_id: None,
+                status: "error",
+                error_message: Some(&issue.to_string()),
+            })?;
+        } else if let Some((Some(issue_key), _, _)) = mutation_details.get(&key) {
+            let site_key = planned_site_key(&plan.mutations, &entry.workspace_id, &entry.entry_id);
+            database.insert_sync_attempt(&crate::db::NewSyncAttempt {
+                sync_run_id: Some(sync_run_id),
+                toggl_workspace_id: &entry.workspace_id,
+                toggl_entry_id: &entry.entry_id,
+                jira_site_key: site_key,
+                jira_issue_key: Some(issue_key),
+                jira_worklog_id: None,
+                status: "planned",
+                error_message: None,
+            })?;
+        }
     }
 
     Ok(())
+}
+
+fn planner_issue_key(issue: &crate::sync::planner::PlannerIssue) -> Option<&str> {
+    match issue {
+        crate::sync::planner::PlannerIssue::UnresolvedIssueSite { issue_key }
+        | crate::sync::planner::PlannerIssue::AmbiguousIssueSite { issue_key } => {
+            Some(issue_key.as_str())
+        }
+        crate::sync::planner::PlannerIssue::MultipleIssueKeys { .. } => None,
+    }
+}
+
+fn planned_site_key<'a>(
+    mutations: &'a [PlannedMutation],
+    workspace_id: &str,
+    entry_id: &str,
+) -> Option<&'a str> {
+    mutations.iter().find_map(|mutation| match mutation {
+        PlannedMutation::Create(create)
+            if create.toggl_workspace_id == workspace_id && create.toggl_entry_id == entry_id =>
+        {
+            Some(create.jira_site_key.as_str())
+        }
+        PlannedMutation::Update(update)
+            if update.toggl_workspace_id == workspace_id && update.toggl_entry_id == entry_id =>
+        {
+            Some(update.jira_site_key.as_str())
+        }
+        PlannedMutation::Delete(delete)
+            if delete.toggl_workspace_id == workspace_id && delete.toggl_entry_id == entry_id =>
+        {
+            Some(delete.jira_site_key.as_str())
+        }
+        _ => None,
+    })
 }
 
 fn stopped_at(entry: &TogglTimeEntry) -> Option<String> {

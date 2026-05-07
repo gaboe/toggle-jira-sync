@@ -273,7 +273,11 @@ fn db_status_rows_derive_local_sync_state() {
     assert!(statuses.contains(&("entry-synced", "synced", None)));
     assert!(statuses.contains(&("entry-not-synced", "not_synced", None)));
     assert!(statuses.contains(&("entry-error", "error", Some("Jira rejected worklog"))));
-    assert!(statuses.contains(&("entry-skipped", "skipped", Some("missing issue key"))));
+    assert!(statuses.contains(&(
+        "entry-skipped",
+        "skipped",
+        Some("no valid Jira issue key found in Toggl description")
+    )));
 }
 
 #[test]

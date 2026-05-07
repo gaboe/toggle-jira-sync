@@ -235,6 +235,31 @@ fn planner_unresolved_or_ambiguous_issue_site_reports_error_without_mutation() {
 }
 
 #[test]
+fn planner_issue_errors_have_actionable_messages() {
+    assert_eq!(
+        PlannerIssue::MultipleIssueKeys {
+            issue_keys: vec!["SAB-123".to_owned(), "CORE-456".to_owned()]
+        }
+        .to_string(),
+        "multiple issue keys found: SAB-123, CORE-456"
+    );
+    assert_eq!(
+        PlannerIssue::UnresolvedIssueSite {
+            issue_key: "SABV-7736".to_owned()
+        }
+        .to_string(),
+        "Jira issue SABV-7736 was not found on any enabled Jira site"
+    );
+    assert_eq!(
+        PlannerIssue::AmbiguousIssueSite {
+            issue_key: "CORE-222".to_owned()
+        }
+        .to_string(),
+        "Jira issue CORE-222 exists on multiple enabled Jira sites"
+    );
+}
+
+#[test]
 fn planner_uses_resolved_issue_site_mapping_not_prefixes() {
     let plan = plan_sync(PlannerInput {
         entries: vec![entry("900001", "SAB-123 belongs to discovered site")],

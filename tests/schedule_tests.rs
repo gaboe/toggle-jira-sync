@@ -112,6 +112,7 @@ fn schedule_install_writes_os_job_file() {
         ])
         .env("HOME", temp.path())
         .env("APPDATA", temp.path())
+        .env("TOGGL_JIRA_SYNC_SKIP_SCHEDULER_LOAD", "1")
         .output()
         .expect("schedule install should run");
 
