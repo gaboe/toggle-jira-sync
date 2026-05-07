@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3
+
+- Improve Jira issue-key error messages and self-recovery in local status state.
+- Fix sync reliability issues from review: real marker timestamps, HTTP timeouts, Jira rate-limit retry, background TUI sync, configured backfill window, safer recovery handling, and transactional migrations.
+
 ## 0.1.2
 
 - Improve README TUI documentation with a text preview.
