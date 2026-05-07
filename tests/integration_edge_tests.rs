@@ -557,7 +557,7 @@ fn integration_edge_dst_timezone_offset_preserved_in_worklog_draft_and_hash() {
 async fn integration_edge_large_initial_backfill_uses_bounded_pages_windows() {
     let now = 1_714_604_800;
     let requested_since = now - 365 * 24 * 60 * 60;
-    let bounded_since = now - 14 * 24 * 60 * 60;
+    let bounded_since = 1_714_521_600;
     let toggl_server = MockServer::start();
     let bounded_fetch = toggl_server.mock(|when, then| {
         when.method(Method::GET)

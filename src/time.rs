@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, SecondsFormat, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, SecondsFormat, TimeZone, Utc};
 
 pub const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 const TOGGL_MAX_BACKFILL_DAYS: u32 = 85;
@@ -9,7 +9,9 @@ pub fn current_rfc3339_utc() -> String {
 
 pub fn initial_backfill_since(now_unix_seconds: i64, initial_backfill_days: u32) -> i64 {
     let bounded_days = initial_backfill_days.min(TOGGL_MAX_BACKFILL_DAYS);
-    now_unix_seconds.saturating_sub(i64::from(bounded_days) * SECONDS_PER_DAY)
+    let configured_since =
+        now_unix_seconds.saturating_sub(i64::from(bounded_days) * SECONDS_PER_DAY);
+    configured_since.max(start_of_utc_month(now_unix_seconds))
 }
 
 pub fn parse_rfc3339_utc(value: &str) -> Option<i64> {
@@ -54,4 +56,14 @@ pub fn format_duration(seconds: i64) -> String {
     } else {
         format!("{}h {}m", minutes / 60, minutes % 60)
     }
+}
+
+fn start_of_utc_month(unix_seconds: i64) -> i64 {
+    let Some(datetime) = Utc.timestamp_opt(unix_seconds, 0).single() else {
+        return unix_seconds;
+    };
+    Utc.with_ymd_and_hms(datetime.year(), datetime.month(), 1, 0, 0, 0)
+        .single()
+        .map(|start| start.timestamp())
+        .unwrap_or(unix_seconds)
 }
