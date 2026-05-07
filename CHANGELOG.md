@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4
+
+- Cap Toggl initial backfill to a safe API window so sync does not fail with `Since cannot be older than 3 months`.
+- Show full sync error chains in the TUI footer.
+
 ## 0.1.3
 
 - Improve Jira issue-key error messages and self-recovery in local status state.
