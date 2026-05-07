@@ -257,6 +257,8 @@ fn record_toggl_entry_ledgers(
             .cloned()
             .unwrap_or_else(|| (None, fallback_source_hash(entry), rounded_duration(entry)));
         let outcome = outcomes.get(&key);
+        let fallback_issue_key = ledger_issue_key(entry, outcome.copied());
+        let ledger_issue_key = issue_key.or(fallback_issue_key.as_deref());
         let status = match outcome {
             Some(PlannerOutcome::Error(_)) => "error",
             _ => "planned",
@@ -266,7 +268,7 @@ fn record_toggl_entry_ledgers(
             toggl_workspace_id: &entry.workspace_id,
             toggl_entry_id: &entry.entry_id,
             description: entry.description.as_deref(),
-            extracted_issue_key: issue_key,
+            extracted_issue_key: ledger_issue_key,
             source_hash: &source_hash,
             rounded_duration_seconds,
             status,
@@ -302,6 +304,21 @@ fn record_toggl_entry_ledgers(
     }
 
     Ok(())
+}
+
+fn ledger_issue_key(entry: &TogglTimeEntry, outcome: Option<&PlannerOutcome>) -> Option<String> {
+    if let Some(PlannerOutcome::Error(issue)) = outcome {
+        if let Some(issue_key) = planner_issue_key(issue) {
+            return Some(issue_key.to_owned());
+        }
+    }
+
+    let description = entry.description.as_deref()?;
+    let issue_keys = extract_issue_keys(description);
+    match issue_keys.as_slice() {
+        [issue_key] => Some(issue_key.clone()),
+        _ => None,
+    }
 }
 
 fn planner_issue_key(issue: &crate::sync::planner::PlannerIssue) -> Option<&str> {
