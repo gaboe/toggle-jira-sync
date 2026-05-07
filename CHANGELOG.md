@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.6
+
+- Show an animated TUI progress message while sync, dry-run, or hourly sync runs in the background.
+
 ## 0.1.5
 
 - Start default initial sync at the first day of the current month so older completed Toggl entries are not pulled into a new install.
