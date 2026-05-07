@@ -16,6 +16,7 @@ exclude = [
     "AGENTS.md",
     "Cargo.toml.orig",
     ".sisyphus/**",
+    ".opencode/**",
 ]
 
 [dependencies]
