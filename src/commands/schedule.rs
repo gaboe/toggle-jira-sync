@@ -13,6 +13,7 @@ use crate::{
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const JOB_NAME: &str = "toggl-jira-sync";
+#[cfg(target_os = "macos")]
 const MACOS_LABEL: &str = "com.toggl-jira-sync.hourly";
 
 pub fn run(args: ScheduleArgs) -> anyhow::Result<()> {
@@ -135,41 +136,41 @@ pub(crate) fn uninstall_job() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_job(path: &Path) -> anyhow::Result<()> {
+fn load_job(_path: &Path) -> anyhow::Result<()> {
     if env::var_os("TOGGL_JIRA_SYNC_SKIP_SCHEDULER_LOAD").is_some() {
         return Ok(());
     }
 
     #[cfg(target_os = "macos")]
     {
-        let _ = quiet_launchctl("unload", path);
+        let _ = quiet_launchctl("unload", _path);
         let output = Command::new("launchctl")
             .arg("load")
-            .arg(path)
+            .arg(_path)
             .output()
             .context("failed to run launchctl load")?;
         if !output.status.success() {
-            bail!("launchctl load failed for {}", path.display());
+            bail!("launchctl load failed for {}", _path.display());
         }
     }
     #[cfg(target_os = "windows")]
     {
         let output = Command::new("cmd")
             .arg("/C")
-            .arg(path)
+            .arg(_path)
             .output()
-            .with_context(|| format!("failed to run {}", path.display()))?;
+            .with_context(|| format!("failed to run {}", _path.display()))?;
         if !output.status.success() {
-            bail!("schtasks create failed for {}", path.display());
+            bail!("schtasks create failed for {}", _path.display());
         }
     }
     Ok(())
 }
 
-fn unload_job(path: &Path) -> anyhow::Result<()> {
+fn unload_job(_path: &Path) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let _ = quiet_launchctl("unload", path);
+        let _ = quiet_launchctl("unload", _path);
     }
     #[cfg(target_os = "windows")]
     {
@@ -177,7 +178,7 @@ fn unload_job(path: &Path) -> anyhow::Result<()> {
             .args(["/Delete", "/F", "/TN", JOB_NAME])
             .output()
             .context("failed to run schtasks delete")?;
-        if !output.status.success() && path.exists() {
+        if !output.status.success() && _path.exists() {
             bail!("schtasks delete failed for {JOB_NAME}");
         }
     }

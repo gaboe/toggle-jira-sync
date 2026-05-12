@@ -1,9 +1,10 @@
 # Changelog
 
-## 0.1.10
+## 0.1.11
 
 - Add unsigned GitHub Release workflow for crates.io CLI publishing and Tauri desktop bundles.
 - Add desktop app release setup documentation.
+- Use Bun for the desktop frontend package workflow.
 
 ## 0.1.6
 
