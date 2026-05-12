@@ -108,6 +108,6 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: Toggl Jira Sync ${{ github.ref_name }}
           releaseBody: Unsigned desktop builds are attached below. The CLI crate is published to crates.io for the same version.
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
