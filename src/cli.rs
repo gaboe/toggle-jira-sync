@@ -38,6 +38,9 @@ pub struct SyncArgs {
     pub dry_run: bool,
 
     #[arg(long)]
+    pub cleanup_deleted: bool,
+
+    #[arg(long)]
     pub json: bool,
 
     #[arg(long, hide = true)]

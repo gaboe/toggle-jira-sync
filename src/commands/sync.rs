@@ -67,6 +67,10 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
         .fetch_time_entries_since(since)
         .await
         .context("failed to fetch Toggl entries")?;
+    if args.cleanup_deleted && !args.dry_run {
+        cleanup_missing_toggl_entries(&database, config.toggl.workspace_id, since, &fetch)
+            .context("failed to cleanup deleted Toggl entries")?;
+    }
     let issue_site_mappings =
         resolve_issue_site_mappings(&config, &credentials, &database, &fetch.entries)
             .await
@@ -129,6 +133,32 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn cleanup_missing_toggl_entries(
+    database: &Database,
+    workspace_id: i64,
+    since: i64,
+    fetch: &crate::toggl::TogglFetchResult,
+) -> anyhow::Result<()> {
+    if fetch
+        .skipped
+        .iter()
+        .any(|skip| skip.reason == crate::toggl::SkipReason::PacingWindow)
+    {
+        return Ok(());
+    }
+    let seen_entry_ids = fetch
+        .entries
+        .iter()
+        .map(|entry| entry.entry_id.clone())
+        .collect::<Vec<_>>();
+    database.mark_missing_toggl_entries_deleted(
+        &workspace_id.to_string(),
+        &format_unix_utc(since),
+        &seen_entry_ids,
+    )?;
     Ok(())
 }
 

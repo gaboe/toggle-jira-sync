@@ -19,14 +19,9 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    cli::{SharedPaths, SyncArgs, TuiArgs},
-    commands::{
-        config::{resolve_config_path, resolve_db_path},
-        schedule,
-    },
-    config::AppConfig,
-    db::{Database, StoredStatusEntry},
-    report::{StatusEntry, StatusReport},
+    app,
+    cli::{SharedPaths, TuiArgs},
+    report::StatusEntry,
     time::{format_duration, split_status_datetime},
 };
 
@@ -37,47 +32,21 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
         );
     }
 
-    let config_path = resolve_config_path(args.paths.config.clone())?;
-    let config = AppConfig::from_path(&config_path)
-        .with_context(|| format!("failed to load config {}", config_path.display()))?;
-    let db_path = resolve_db_path(
-        args.paths.db.clone(),
-        &config_path,
-        config.runtime.sqlite_path.as_deref(),
-        "tui",
-    )?;
-    let database = Database::open(&db_path)
-        .with_context(|| format!("failed to open SQLite DB {}", db_path.display()))?;
-    database
-        .run_migrations()
-        .context("failed to run DB migrations")?;
-    let rows = database
-        .list_status_entries(args.limit)
-        .context("failed to load status rows")?;
-    let base_urls = config
-        .enabled_jira_sites()
-        .into_iter()
-        .map(|site| {
-            (
-                site.key.clone(),
-                site.base_url.trim_end_matches('/').to_owned(),
-            )
-        })
-        .collect();
+    let (_, config, report) = app::status_report(args.paths.clone(), args.limit)?;
+    let base_urls = app::jira_base_urls(&config);
 
     let sync_paths = args.paths.clone();
     let mut terminal = ratatui::init();
     let result = run_app(
         &mut terminal,
         TuiApp::new(
-            status_entries(rows),
+            report.entries,
             base_urls,
             config.schedule.enabled,
             config.schedule.interval_minutes,
         ),
         sync_paths,
-        config_path,
-        db_path,
+        args.paths.clone(),
         args.limit,
     )
     .await;
@@ -89,8 +58,7 @@ async fn run_app(
     terminal: &mut DefaultTerminal,
     mut app: TuiApp,
     sync_paths: SharedPaths,
-    config_path: std::path::PathBuf,
-    db_path: std::path::PathBuf,
+    paths: SharedPaths,
     limit: usize,
 ) -> anyhow::Result<()> {
     let sync_interval = Duration::from_secs(60 * 60);
@@ -105,7 +73,7 @@ async fn run_app(
             let pending = pending_sync.take().expect("pending sync should exist");
             app.message = match pending.handle.join() {
                 Ok(Ok(())) => {
-                    refresh_rows(&mut app, &db_path, limit)?;
+                    refresh_rows(&mut app, paths.clone(), limit)?;
                     finished_sync_message(
                         pending.label,
                         pending.before_counts,
@@ -178,42 +146,21 @@ async fn run_app(
                         }
                         TuiAction::ToggleSchedule => {
                             let enabled = !app.schedule_enabled;
-                            if enabled {
-                                match schedule::install_default_job(
-                                    &config_path,
-                                    app.schedule_interval_minutes,
-                                ) {
-                                    Ok(()) => {
-                                        schedule::update_schedule_config(
-                                            &config_path,
-                                            None,
-                                            Some(true),
-                                        )?;
-                                        app.schedule_enabled = true;
-                                        app.message = format!(
+                            match app::update_schedule(paths.clone(), enabled) {
+                                Ok(schedule) => {
+                                    app.schedule_enabled = schedule.enabled;
+                                    app.schedule_interval_minutes = schedule.interval_minutes;
+                                    app.message = if schedule.enabled {
+                                        format!(
                                             "OS schedule enabled: every {} minutes",
-                                            app.schedule_interval_minutes
-                                        );
-                                    }
-                                    Err(error) => {
-                                        app.message = format!("OS schedule enable failed: {error}");
-                                    }
+                                            schedule.interval_minutes
+                                        )
+                                    } else {
+                                        "OS schedule disabled".to_owned()
+                                    };
                                 }
-                            } else {
-                                match schedule::uninstall_job() {
-                                    Ok(()) => {
-                                        schedule::update_schedule_config(
-                                            &config_path,
-                                            None,
-                                            Some(false),
-                                        )?;
-                                        app.schedule_enabled = false;
-                                        app.message = "OS schedule disabled".to_owned();
-                                    }
-                                    Err(error) => {
-                                        app.message =
-                                            format!("OS schedule disable failed: {error}");
-                                    }
+                                Err(error) => {
+                                    app.message = format!("OS schedule update failed: {error}");
                                 }
                             }
                         }
@@ -280,28 +227,14 @@ fn hourly_sync_due(now: Instant, next_sync: Instant) -> bool {
     now >= next_sync
 }
 
-fn refresh_rows(app: &mut TuiApp, db_path: &std::path::Path, limit: usize) -> anyhow::Result<()> {
-    let database = Database::open(db_path)
-        .with_context(|| format!("failed to open SQLite DB {}", db_path.display()))?;
-    let rows = database
-        .list_status_entries(limit)
-        .context("failed to reload status rows")?;
-    app.set_rows(status_entries(rows));
+fn refresh_rows(app: &mut TuiApp, paths: SharedPaths, limit: usize) -> anyhow::Result<()> {
+    let (_, _, report) = app::status_report(paths, limit)?;
+    app.set_rows(report.entries);
     Ok(())
 }
 
-fn status_entries(rows: Vec<StoredStatusEntry>) -> Vec<StatusEntry> {
-    StatusReport::from_rows(rows).entries
-}
-
 async fn run_sync_action(paths: SharedPaths, dry_run: bool) -> anyhow::Result<()> {
-    crate::commands::sync::run(SyncArgs {
-        paths,
-        dry_run,
-        json: false,
-        quiet: true,
-    })
-    .await
+    app::run_sync(paths, dry_run, false).await
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

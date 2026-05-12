@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.9
+
+- Add unsigned GitHub Release workflow for crates.io CLI publishing and Tauri desktop bundles.
+- Add desktop app release setup documentation.
+
 ## 0.1.6
 
 - Show an animated TUI progress message while sync, dry-run, or hourly sync runs in the background.

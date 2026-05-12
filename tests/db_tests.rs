@@ -281,6 +281,50 @@ fn db_status_rows_derive_local_sync_state() {
 }
 
 #[test]
+fn deleted_toggl_entries_are_hidden_from_status_rows() {
+    let (_file, db) = temp_database();
+    db.run_migrations().expect("migrations should run");
+
+    db.upsert_toggl_entry(&NewTogglEntry {
+        toggl_workspace_id: "workspace-1",
+        toggl_entry_id: "stale-entry",
+        description: Some("old local entry without issue"),
+        extracted_issue_key: None,
+        source_hash: "sha256:stale",
+        rounded_duration_seconds: 7920,
+        status: "planned",
+        started_at: Some("2026-05-07T12:14:00Z"),
+        stopped_at: Some("2026-05-07T14:27:00Z"),
+    })
+    .expect("stale entry should insert");
+    db.upsert_toggl_entry(&NewTogglEntry {
+        toggl_workspace_id: "workspace-1",
+        toggl_entry_id: "seen-entry",
+        description: Some("CORE-1 active entry"),
+        extracted_issue_key: Some("CORE-1"),
+        source_hash: "sha256:seen",
+        rounded_duration_seconds: 1800,
+        status: "planned",
+        started_at: Some("2026-05-08T12:14:00Z"),
+        stopped_at: Some("2026-05-08T12:44:00Z"),
+    })
+    .expect("seen entry should insert");
+
+    let deleted = db
+        .mark_missing_toggl_entries_deleted(
+            "workspace-1",
+            "2026-05-01T00:00:00Z",
+            &["seen-entry".to_owned()],
+        )
+        .expect("missing entries should be marked deleted");
+
+    assert_eq!(deleted, 1);
+    let rows = db.list_status_entries(10).expect("status rows should load");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].entry, "seen-entry");
+}
+
+#[test]
 fn db_lock_rejects_second_owner() {
     let file = NamedTempFile::new().expect("temp sqlite file should be created");
     let first = Database::open(file.path()).expect("first connection should open");

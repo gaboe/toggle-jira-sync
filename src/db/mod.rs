@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, ErrorCode, OptionalExtension};
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../../migrations/001_sync_ledger.sql")),
@@ -499,16 +499,17 @@ impl Database {
                     WHEN entry.rounded_duration_seconds = 0 THEN 'rounded duration is zero'
                     ELSE NULL
                 END AS reason
-             FROM toggl_entries entry
+              FROM toggl_entries entry
              LEFT JOIN jira_worklog_links link
                 ON link.toggl_workspace_id = entry.toggl_workspace_id
                AND link.toggl_entry_id = entry.toggl_entry_id
                AND link.deleted_at IS NULL
-             LEFT JOIN latest_attempt
+              LEFT JOIN latest_attempt
                 ON latest_attempt.toggl_workspace_id = entry.toggl_workspace_id
                AND latest_attempt.toggl_entry_id = entry.toggl_entry_id
-             ORDER BY entry.started_at IS NULL, entry.started_at DESC, entry.toggl_workspace_id, entry.toggl_entry_id
-             LIMIT ?1",
+              WHERE entry.deleted_at IS NULL
+              ORDER BY entry.started_at IS NULL, entry.started_at DESC, entry.toggl_workspace_id, entry.toggl_entry_id
+              LIMIT ?1",
         )?;
 
         let rows = statement
@@ -529,6 +530,36 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(rows)
+    }
+
+    pub fn mark_missing_toggl_entries_deleted(
+        &self,
+        toggl_workspace_id: &str,
+        started_at_since: &str,
+        seen_entry_ids: &[String],
+    ) -> DbResult<usize> {
+        let placeholders = std::iter::repeat_n("?", seen_entry_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let not_seen_clause = if seen_entry_ids.is_empty() {
+            String::new()
+        } else {
+            format!(" AND toggl_entry_id NOT IN ({placeholders})")
+        };
+        let sql = format!(
+            "UPDATE toggl_entries
+             SET status = 'deleted',
+                 deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE toggl_workspace_id = ?
+               AND deleted_at IS NULL
+               AND started_at >= ?{not_seen_clause}"
+        );
+        let params = std::iter::once(toggl_workspace_id.to_owned())
+            .chain(std::iter::once(started_at_since.to_owned()))
+            .chain(seen_entry_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        Ok(self.connection.execute(&sql, params_from_iter(params))?)
     }
 
     pub fn mark_jira_worklog_link_deleted(

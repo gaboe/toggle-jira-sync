@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt, fs, path::Path};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_INITIAL_BACKFILL_DAYS: u32 = 90;
 const DEFAULT_RECOVERY_SCAN_DAYS: u32 = 180;
@@ -40,7 +40,7 @@ struct RawConfig {
     jira: JiraConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TogglConfig {
     pub workspace_id: i64,
@@ -49,7 +49,7 @@ pub struct TogglConfig {
     pub base_url: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default)]
@@ -70,7 +70,7 @@ impl Default for RuntimeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
     #[serde(default = "default_toggl_max_rps")]
@@ -81,7 +81,7 @@ pub struct RateLimitConfig {
     pub jira_same_issue_write_delay_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduleConfig {
     #[serde(default = "default_schedule_enabled")]
@@ -109,13 +109,13 @@ impl Default for RateLimitConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct JiraConfig {
     pub sites: Vec<JiraSiteConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct JiraSiteConfig {
     pub key: String,
@@ -126,7 +126,7 @@ pub struct JiraSiteConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AppConfig {
     pub toggl: TogglConfig,
     pub runtime: RuntimeConfig,
