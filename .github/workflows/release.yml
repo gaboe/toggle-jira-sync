@@ -74,12 +74,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-          cache: npm
-          cache-dependency-path: tauri/package-lock.json
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -95,7 +91,7 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: tauri
-        run: npm ci
+        run: bun install --frozen-lockfile
 
       - name: Build and upload Tauri bundles
         uses: tauri-apps/tauri-action@v0

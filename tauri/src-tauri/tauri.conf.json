@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Toggl Jira Sync",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "identifier": "dev.toggl-jira-sync.tauri",
   "build": {
-    "beforeDevCommand": "npm run dev -- --host 127.0.0.1",
+    "beforeDevCommand": "bun run dev -- --host 127.0.0.1",
     "devUrl": "http://127.0.0.1:5173",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "bun run build",
     "frontendDist": "../dist"
   },
   "app": {

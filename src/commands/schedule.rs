@@ -1,4 +1,7 @@
-use std::{env, fs, path::Path, path::PathBuf, process::Command};
+use std::{env, fs, path::Path, path::PathBuf};
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::process::Command;
 
 use anyhow::{anyhow, bail, Context};
 
