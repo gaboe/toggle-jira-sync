@@ -99,6 +99,11 @@ jobs:
         working-directory: tauri
         run: bun install --frozen-lockfile
 
+      - name: Extract release version
+        id: release-version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - name: Build and upload Tauri bundles
         uses: tauri-apps/tauri-action@v0
         env:
@@ -110,7 +115,7 @@ jobs:
           releaseBody: |
             Unsigned desktop builds are attached below.
 
-            CLI crate for this version: https://crates.io/crates/toggl-jira-sync/${{ github.ref_name }}
+            CLI crate for this version: https://crates.io/crates/toggl-jira-sync/${{ steps.release-version.outputs.version }}
 
             Install or update the CLI with Cargo:
 
