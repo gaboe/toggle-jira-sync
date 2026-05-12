@@ -106,8 +106,25 @@ jobs:
         with:
           projectPath: tauri
           tagName: ${{ github.ref_name }}
-          releaseName: Toggl Jira Sync ${{ github.ref_name }}
-          releaseBody: Unsigned desktop builds are attached below. The CLI crate is published to crates.io for the same version.
+          releaseName: toggl-jira-sync ${{ github.ref_name }}
+          releaseBody: |
+            Unsigned desktop builds are attached below.
+
+            CLI crate for this version: https://crates.io/crates/toggl-jira-sync/${{ github.ref_name }}
+
+            Install or update the CLI with Cargo:
+
+            ```sh
+            cargo install toggl-jira-sync --force
+            ```
+
+            Desktop download guide:
+            - macOS Apple Silicon: `toggl-jira-sync_*_aarch64.dmg`
+            - macOS Intel: `toggl-jira-sync_*_x64.dmg`
+            - Windows installer: `toggl-jira-sync_*_x64-setup.exe` or `toggl-jira-sync_*_x64_en-US.msi`
+            - Linux AppImage: `toggl-jira-sync_*_amd64.AppImage`
+            - Linux Debian/Ubuntu: `toggl-jira-sync_*_amd64.deb`
+            - Linux Fedora/RHEL: `toggl-jira-sync-*-1.x86_64.rpm`
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
