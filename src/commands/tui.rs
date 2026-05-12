@@ -736,7 +736,7 @@ mod tests {
         );
 
         app.issue_filter = "223".to_owned();
-        app.date_filter = "17:59".to_owned();
+        app.date_filter = "2026-05-04".to_owned();
         app.apply_filters();
 
         assert_eq!(app.visible.len(), 1);
