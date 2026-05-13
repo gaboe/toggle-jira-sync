@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.16
+## 0.1.17
 
 - Add unsigned GitHub Release workflow for crates.io CLI publishing and Tauri desktop bundles.
 - Add desktop app release setup documentation.
@@ -9,6 +9,7 @@
 - Add the Windows desktop bundle icon.
 - Publish GitHub Releases publicly instead of as drafts.
 - Use clearer GitHub Release names, asset base names, and install instructions.
+- Verify public release notes with the corrected crates.io version URL.
 
 ## 0.1.6
 
