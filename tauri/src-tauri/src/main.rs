@@ -27,14 +27,14 @@ fn status() -> Result<StatusReport, String> {
 }
 
 #[tauri::command]
-fn dry_run() -> Result<AppStateSnapshot, String> {
-    run_sync_blocking(true)?;
+async fn dry_run() -> Result<AppStateSnapshot, String> {
+    run_sync_off_thread(true).await?;
     snapshot()
 }
 
 #[tauri::command]
-fn sync() -> Result<AppStateSnapshot, String> {
-    run_sync_blocking(false)?;
+async fn sync() -> Result<AppStateSnapshot, String> {
+    run_sync_off_thread(false).await?;
     snapshot()
 }
 
@@ -83,13 +83,17 @@ fn default_paths() -> SharedPaths {
     }
 }
 
-fn run_sync_blocking(dry_run: bool) -> Result<(), String> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("failed to start sync runtime: {error}"))?
-        .block_on(app::run_sync(default_paths(), dry_run, !dry_run))
-        .map_err(format_tauri_error)
+async fn run_sync_off_thread(dry_run: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("failed to start sync runtime: {error}"))?
+            .block_on(app::run_sync(default_paths(), dry_run, !dry_run))
+            .map_err(format_tauri_error)
+    })
+    .await
+    .map_err(|error| format!("sync task failed: {error}"))?
 }
 
 fn format_tauri_error(error: anyhow::Error) -> String {
