@@ -128,9 +128,9 @@ fn job_installation_unchanged(
     #[cfg(target_os = "linux")]
     {
         let service_path = path.with_file_name(format!("{JOB_NAME}.service"));
-        return Ok(service_path.exists()
+        Ok(service_path.exists()
             && fs::read_to_string(&service_path)?
-                == render_systemd_service(_executable, _config_path));
+                == render_systemd_service(_executable, _config_path))
     }
 
     #[cfg(not(target_os = "linux"))]
