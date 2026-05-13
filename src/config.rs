@@ -54,8 +54,12 @@ pub struct TogglConfig {
 pub struct RuntimeConfig {
     #[serde(default)]
     pub sqlite_path: Option<String>,
+    #[serde(default)]
+    pub initial_backfill_from_month: Option<String>,
     #[serde(default = "default_initial_backfill_days")]
     pub initial_backfill_days: u32,
+    #[serde(default)]
+    pub recovery_from_month: Option<String>,
     #[serde(default = "default_recovery_scan_days")]
     pub recovery_scan_days: u32,
 }
@@ -64,7 +68,9 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             sqlite_path: None,
+            initial_backfill_from_month: None,
             initial_backfill_days: DEFAULT_INITIAL_BACKFILL_DAYS,
+            recovery_from_month: None,
             recovery_scan_days: DEFAULT_RECOVERY_SCAN_DAYS,
         }
     }
@@ -182,8 +188,16 @@ impl AppConfig {
             errors.push("runtime.initial_backfill_days must be greater than 0".to_owned());
         }
 
+        if let Some(month) = self.runtime.initial_backfill_from_month.as_deref() {
+            validate_month_reference(&mut errors, "runtime.initial_backfill_from_month", month);
+        }
+
         if self.runtime.recovery_scan_days == 0 {
             errors.push("runtime.recovery_scan_days must be greater than 0".to_owned());
+        }
+
+        if let Some(month) = self.runtime.recovery_from_month.as_deref() {
+            validate_month_reference(&mut errors, "runtime.recovery_from_month", month);
         }
 
         if self.rate_limits.toggl_max_rps <= 0.0 {
@@ -267,6 +281,12 @@ fn push_env_var_reference(errors: &mut Vec<String>, field: &str, value: &str) {
         errors.push(format!(
             "{field} must be an environment variable name using letters, digits, and underscores"
         ));
+    }
+}
+
+fn validate_month_reference(errors: &mut Vec<String>, field: &str, value: &str) {
+    if crate::time::month_start_since(value).is_none() {
+        errors.push(format!("{field} must use MM.YYYY, for example 05.2026"));
     }
 }
 

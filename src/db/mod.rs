@@ -562,6 +562,23 @@ impl Database {
         Ok(self.connection.execute(&sql, params_from_iter(params))?)
     }
 
+    pub fn mark_toggl_entry_deleted(
+        &self,
+        toggl_workspace_id: &str,
+        toggl_entry_id: &str,
+    ) -> DbResult<()> {
+        self.connection.execute(
+            "UPDATE toggl_entries
+             SET status = 'deleted',
+                 deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE toggl_workspace_id = ?1
+               AND toggl_entry_id = ?2",
+            params![toggl_workspace_id, toggl_entry_id],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_jira_worklog_link_deleted(
         &self,
         toggl_workspace_id: &str,

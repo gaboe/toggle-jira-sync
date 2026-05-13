@@ -87,15 +87,16 @@ pub(crate) fn install_job(
     interval_minutes: u32,
 ) -> anyhow::Result<()> {
     let path = job_path()?;
+    let job_file = render_job_file(executable, config_path, interval_minutes);
+    if job_installation_unchanged(&path, &job_file, executable, config_path)? {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::write(
-        &path,
-        render_job_file(executable, config_path, interval_minutes),
-    )
-    .with_context(|| format!("failed to write schedule job {}", path.display()))?;
+    fs::write(&path, job_file)
+        .with_context(|| format!("failed to write schedule job {}", path.display()))?;
     load_job(&path)?;
     #[cfg(target_os = "linux")]
     {
@@ -112,6 +113,28 @@ pub(crate) fn install_job(
         })?;
     }
     Ok(())
+}
+
+fn job_installation_unchanged(
+    path: &Path,
+    job_file: &str,
+    _executable: &Path,
+    _config_path: &Path,
+) -> anyhow::Result<bool> {
+    if !path.exists() || fs::read_to_string(path)? != job_file {
+        return Ok(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let service_path = path.with_file_name(format!("{JOB_NAME}.service"));
+        return Ok(service_path.exists()
+            && fs::read_to_string(&service_path)?
+                == render_systemd_service(_executable, _config_path));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    Ok(true)
 }
 
 pub(crate) fn uninstall_job() -> anyhow::Result<()> {
@@ -284,6 +307,7 @@ fn render_macos_plist(executable: &Path, config_path: &Path, interval_minutes: u
   <array>
     <string>{}</string>
     <string>sync</string>
+    <string>--cleanup-deleted</string>
     <string>--config</string>
     <string>{}</string>
   </array>
@@ -323,7 +347,7 @@ fn render_systemd_timer(_executable: &Path, _config_path: &Path, interval_minute
 #[cfg(target_os = "linux")]
 fn render_systemd_service(executable: &Path, config_path: &Path) -> String {
     format!(
-        "[Unit]\nDescription=Toggl Jira Sync\n\n[Service]\nType=oneshot\nExecStart={} sync --config {}\n",
+        "[Unit]\nDescription=Toggl Jira Sync\n\n[Service]\nType=oneshot\nExecStart={} sync --cleanup-deleted --config {}\n",
         executable.display(),
         config_path.display()
     )
@@ -332,7 +356,7 @@ fn render_systemd_service(executable: &Path, config_path: &Path) -> String {
 #[cfg(target_os = "windows")]
 fn render_windows_command(executable: &Path, config_path: &Path, interval_minutes: u32) -> String {
     format!(
-        "schtasks /Create /F /SC MINUTE /MO {} /TN {} /TR \"\\\"{}\\\" sync --config \\\"{}\\\"\"\r\n",
+        "schtasks /Create /F /SC MINUTE /MO {} /TN {} /TR \"\\\"{}\\\" sync --cleanup-deleted --config \\\"{}\\\"\"\r\n",
         interval_minutes,
         JOB_NAME,
         executable.display(),

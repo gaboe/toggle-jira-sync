@@ -3,7 +3,10 @@ use std::{fmt, sync::Mutex, time::Duration};
 use reqwest::Url;
 use serde::Deserialize;
 
-use crate::{config::AppConfig, time::initial_backfill_since};
+use crate::{
+    config::AppConfig,
+    time::{initial_backfill_since, month_start_since},
+};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -77,6 +80,7 @@ pub struct TogglClientConfig {
     pub workspace_id: i64,
     pub api_token: String,
     pub max_rps: f64,
+    pub initial_backfill_from_month: Option<String>,
     pub initial_backfill_days: u32,
 }
 
@@ -91,11 +95,19 @@ impl TogglClientConfig {
             workspace_id: config.toggl.workspace_id,
             api_token,
             max_rps: config.rate_limits.toggl_max_rps,
+            initial_backfill_from_month: config.runtime.initial_backfill_from_month.clone(),
             initial_backfill_days: config.runtime.initial_backfill_days,
         })
     }
 
     pub fn initial_backfill_since(&self, now_unix_seconds: i64) -> i64 {
+        if let Some(month) = self
+            .initial_backfill_from_month
+            .as_deref()
+            .and_then(month_start_since)
+        {
+            return month;
+        }
         initial_backfill_since(now_unix_seconds, self.initial_backfill_days)
     }
 }
@@ -108,6 +120,10 @@ impl fmt::Debug for TogglClientConfig {
             .field("workspace_id", &self.workspace_id)
             .field("api_token", &"<redacted>")
             .field("max_rps", &self.max_rps)
+            .field(
+                "initial_backfill_from_month",
+                &self.initial_backfill_from_month,
+            )
             .field("initial_backfill_days", &self.initial_backfill_days)
             .finish()
     }

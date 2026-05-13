@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Local, SecondsFormat, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, SecondsFormat, TimeZone, Utc};
 
 pub const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 const TOGGL_MAX_BACKFILL_DAYS: u32 = 85;
@@ -12,6 +12,15 @@ pub fn initial_backfill_since(now_unix_seconds: i64, initial_backfill_days: u32)
     let configured_since =
         now_unix_seconds.saturating_sub(i64::from(bounded_days) * SECONDS_PER_DAY);
     configured_since.max(start_of_utc_month(now_unix_seconds))
+}
+
+pub fn month_start_since(month: &str) -> Option<i64> {
+    let (month, year) = month.trim().split_once('.')?;
+    let month = month.parse::<u32>().ok()?;
+    let year = year.parse::<i32>().ok()?;
+    let date = NaiveDate::from_ymd_opt(year, month, 1)?;
+    date.and_hms_opt(0, 0, 0)
+        .map(|datetime| Utc.from_utc_datetime(&datetime).timestamp())
 }
 
 pub fn parse_rfc3339_utc(value: &str) -> Option<i64> {

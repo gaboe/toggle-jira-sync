@@ -164,6 +164,17 @@ async fn run_app(
                                 }
                             }
                         }
+                        TuiAction::ExportConfig => match app::export_config(paths.clone()) {
+                            Ok(result) => {
+                                app.message = format!("configuration exported: {}", result.path);
+                            }
+                            Err(error) => {
+                                app.message = format!(
+                                    "configuration export failed: {}",
+                                    crate::format_error_chain(&error).replace('\n', " | ")
+                                );
+                            }
+                        },
                     }
                 }
             }
@@ -358,6 +369,7 @@ enum TuiAction {
     DryRun,
     Sync,
     ToggleSchedule,
+    ExportConfig,
 }
 
 impl TuiApp {
@@ -380,7 +392,7 @@ impl TuiApp {
             issue_filter: String::new(),
             date_filter: String::new(),
             message:
-                "↑/↓ move · / issue · f date · d dry-run · s sync · a OS schedule · o issue · w worklog · r reset · q quit"
+                "↑/↓ move · / issue · f date · d dry-run · s sync · a OS schedule · x export config · o issue · w worklog · r reset · q quit"
                     .to_owned(),
             schedule_enabled,
             schedule_interval_minutes,
@@ -420,6 +432,7 @@ impl TuiApp {
             KeyCode::Char('d') => return TuiAction::DryRun,
             KeyCode::Char('s') => return TuiAction::Sync,
             KeyCode::Char('a') => return TuiAction::ToggleSchedule,
+            KeyCode::Char('x') => return TuiAction::ExportConfig,
             KeyCode::Char('o') => {
                 if let Some(url) = self.selected_row().and_then(|row| row.issue_url.clone()) {
                     return TuiAction::OpenIssue(url);
@@ -793,6 +806,10 @@ mod tests {
         assert!(matches!(
             app.handle_key(KeyCode::Char('a')),
             TuiAction::ToggleSchedule
+        ));
+        assert!(matches!(
+            app.handle_key(KeyCode::Char('x')),
+            TuiAction::ExportConfig
         ));
     }
 

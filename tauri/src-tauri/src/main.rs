@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use toggl_jira_sync::{
-    app::{self, AppStateSnapshot, ConfigOnlySnapshot, ConfigSnapshot, ConfigUpdate, DeleteLocalDataResult, ScheduleSnapshot},
+    app::{self, AppStateSnapshot, ConfigOnlySnapshot, ConfigSnapshot, ConfigUpdate, DeleteLocalDataResult, ExportConfigResult, ScheduleSnapshot},
     cli::SharedPaths,
     format_error_chain,
     report::StatusReport,
@@ -54,6 +54,11 @@ fn delete_local_data() -> Result<DeleteLocalDataResult, String> {
 }
 
 #[tauri::command]
+fn export_config() -> Result<ExportConfigResult, String> {
+    app::export_config(default_paths()).map_err(format_tauri_error)
+}
+
+#[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
     let status = if cfg!(target_os = "macos") {
         Command::new("open").arg(url).status()
@@ -102,6 +107,7 @@ fn main() {
             toggle_schedule,
             save_config,
             delete_local_data,
+            export_config,
             open_url
         ])
         .run(tauri::generate_context!())

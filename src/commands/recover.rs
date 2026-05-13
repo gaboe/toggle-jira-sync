@@ -56,7 +56,11 @@ pub async fn run(args: RecoverArgs) -> anyhow::Result<()> {
         TogglClientConfig::from_app_config(&config, toggl_token, config.toggl.base_url.clone())
             .context("failed to build Toggl client config")?;
     let toggl = TogglClient::new(toggl_config).context("failed to build Toggl client")?;
-    let since = recovery_since(current_unix_seconds(), config.runtime.recovery_scan_days);
+    let since = recovery_since(
+        current_unix_seconds(),
+        config.runtime.recovery_from_month.as_deref(),
+        config.runtime.recovery_scan_days,
+    );
     let fetch = toggl
         .fetch_time_entries_since(since)
         .await
@@ -153,7 +157,14 @@ fn build_recovery_sites(
         .collect()
 }
 
-fn recovery_since(now_unix_seconds: i64, recovery_scan_days: u32) -> i64 {
+fn recovery_since(
+    now_unix_seconds: i64,
+    recovery_from_month: Option<&str>,
+    recovery_scan_days: u32,
+) -> i64 {
+    if let Some(month) = recovery_from_month.and_then(crate::time::month_start_since) {
+        return month;
+    }
     now_unix_seconds - i64::from(recovery_scan_days) * SECONDS_PER_DAY
 }
 

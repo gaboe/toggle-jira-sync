@@ -4,7 +4,9 @@ api_token_env = "TOGGL_API_TOKEN"
 
 [runtime]
 sqlite_path = "toggl-jira-sync.sqlite"
+initial_backfill_from_month = "05.2026"
 initial_backfill_days = 90
+recovery_from_month = "05.2026"
 recovery_scan_days = 180
 
 [rate_limits]

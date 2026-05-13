@@ -41,7 +41,9 @@ pub struct ConfigSnapshot {
     pub toggl_api_token_present: bool,
     pub toggl_api_token_value: Option<String>,
     pub sqlite_path: String,
+    pub initial_backfill_from_month: Option<String>,
     pub initial_backfill_days: u32,
+    pub recovery_from_month: Option<String>,
     pub recovery_scan_days: u32,
     pub schedule_enabled: bool,
     pub schedule_interval_minutes: u32,
@@ -51,6 +53,11 @@ pub struct ConfigSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct DeleteLocalDataResult {
     pub deleted: bool,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportConfigResult {
     pub path: String,
 }
 
@@ -73,7 +80,9 @@ pub struct ConfigUpdate {
     pub toggl_api_token_env: String,
     pub toggl_api_token_value: Option<String>,
     pub sqlite_path: String,
+    pub initial_backfill_from_month: Option<String>,
     pub initial_backfill_days: u32,
+    pub recovery_from_month: Option<String>,
     pub recovery_scan_days: u32,
     pub schedule_enabled: bool,
     pub schedule_interval_minutes: u32,
@@ -147,12 +156,12 @@ pub fn status_report(
 pub async fn run_sync(
     paths: SharedPaths,
     dry_run: bool,
-    cleanup_deleted: bool,
+    _cleanup_deleted: bool,
 ) -> anyhow::Result<()> {
     crate::commands::sync::run(SyncArgs {
         paths,
         dry_run,
-        cleanup_deleted,
+        cleanup_deleted: true,
         json: false,
         quiet: true,
     })
@@ -218,6 +227,45 @@ pub fn delete_local_data(paths: SharedPaths) -> anyhow::Result<DeleteLocalDataRe
     })
 }
 
+pub fn export_config(paths: SharedPaths) -> anyhow::Result<ExportConfigResult> {
+    let config_path = resolve_config_path(paths.config)?;
+    let downloads = downloads_dir().context("failed to resolve Downloads directory")?;
+    export_config_to_dir(config_path, downloads)
+}
+
+fn export_config_to_dir(
+    config_path: PathBuf,
+    downloads: PathBuf,
+) -> anyhow::Result<ExportConfigResult> {
+    let contents = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read config {}", config_path.display()))?;
+    fs::create_dir_all(&downloads)
+        .with_context(|| format!("failed to create {}", downloads.display()))?;
+    let backup_path = downloads.join(format!(
+        "toggl-jira-sync-config-{}.toml",
+        crate::time::current_rfc3339_utc()
+            .replace([':', '-'], "")
+            .replace('T', "-")
+            .replace('Z', "")
+    ));
+    fs::write(&backup_path, contents)
+        .with_context(|| format!("failed to write config backup {}", backup_path.display()))?;
+    Ok(ExportConfigResult {
+        path: backup_path.display().to_string(),
+    })
+}
+
+fn downloads_dir() -> anyhow::Result<PathBuf> {
+    if cfg!(windows) {
+        if let Some(user_profile) = env::var_os("USERPROFILE") {
+            return Ok(PathBuf::from(user_profile).join("Downloads"));
+        }
+    }
+    env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Downloads"))
+        .context("HOME is not set")
+}
+
 pub fn jira_base_urls(config: &AppConfig) -> HashMap<String, String> {
     config
         .enabled_jira_sites()
@@ -248,7 +296,9 @@ impl ConfigSnapshot {
                 .sqlite_path
                 .clone()
                 .unwrap_or_else(|| "toggl-jira-sync.sqlite".to_owned()),
+            initial_backfill_from_month: config.runtime.initial_backfill_from_month.clone(),
             initial_backfill_days: config.runtime.initial_backfill_days,
+            recovery_from_month: config.runtime.recovery_from_month.clone(),
             recovery_scan_days: config.runtime.recovery_scan_days,
             schedule_enabled: config.schedule.enabled,
             schedule_interval_minutes: config.schedule.interval_minutes,
@@ -369,7 +419,9 @@ api_token_env = "{toggl_api_token_env}"
 
 [runtime]
 sqlite_path = "{sqlite_path}"
+{initial_backfill_from_month}
 initial_backfill_days = {initial_backfill_days}
+{recovery_from_month}
 recovery_scan_days = {recovery_scan_days}
 
 [schedule]
@@ -381,7 +433,13 @@ interval_minutes = {schedule_interval_minutes}
         workspace_id = update.toggl_workspace_id,
         toggl_api_token_env = escape_toml_string(&update.toggl_api_token_env),
         sqlite_path = escape_toml_string(&update.sqlite_path),
+        initial_backfill_from_month = render_optional_string(
+            "initial_backfill_from_month",
+            update.initial_backfill_from_month.as_deref()
+        ),
         initial_backfill_days = update.initial_backfill_days,
+        recovery_from_month =
+            render_optional_string("recovery_from_month", update.recovery_from_month.as_deref()),
         recovery_scan_days = update.recovery_scan_days,
         schedule_enabled = update.schedule_enabled,
         schedule_interval_minutes = update.schedule_interval_minutes,
@@ -410,6 +468,13 @@ fn escape_toml_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+fn render_optional_string(key: &str, value: Option<&str>) -> String {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("{key} = \"{}\"", escape_toml_string(value.trim())))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,7 +494,9 @@ mod tests {
                 toggl_api_token_env: "TOGGL_API_TOKEN".to_owned(),
                 toggl_api_token_value: None,
                 sqlite_path: "toggl-jira-sync.sqlite".to_owned(),
+                initial_backfill_from_month: Some("05.2026".to_owned()),
                 initial_backfill_days: 90,
+                recovery_from_month: None,
                 recovery_scan_days: 180,
                 schedule_enabled: true,
                 schedule_interval_minutes: 60,
@@ -467,7 +534,9 @@ mod tests {
                 toggl_api_token_env: "TOGGL_API_TOKEN".to_owned(),
                 toggl_api_token_value: None,
                 sqlite_path: "toggl-jira-sync.sqlite".to_owned(),
+                initial_backfill_from_month: None,
                 initial_backfill_days: 90,
+                recovery_from_month: None,
                 recovery_scan_days: 180,
                 schedule_enabled: true,
                 schedule_interval_minutes: 60,
@@ -495,5 +564,50 @@ mod tests {
         assert_eq!(result.path, db_path.display().to_string());
         assert!(!db_path.exists());
         assert!(config_path.exists());
+    }
+
+    #[test]
+    fn export_config_writes_backup_to_downloads_without_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let downloads_path = dir.path().join("Downloads");
+
+        save_config(
+            SharedPaths {
+                config: Some(config_path.clone()),
+                db: None,
+            },
+            ConfigUpdate {
+                toggl_workspace_id: 123,
+                toggl_api_token_env: "TOGGL_API_TOKEN".to_owned(),
+                toggl_api_token_value: Some("secret-token".to_owned()),
+                sqlite_path: "toggl-jira-sync.sqlite".to_owned(),
+                initial_backfill_from_month: Some("05.2026".to_owned()),
+                initial_backfill_days: 90,
+                recovery_from_month: Some("05.2026".to_owned()),
+                recovery_scan_days: 180,
+                schedule_enabled: true,
+                schedule_interval_minutes: 60,
+                jira_sites: vec![JiraSiteUpdate {
+                    key: "acme".to_owned(),
+                    base_url: "https://acme.atlassian.net".to_owned(),
+                    email_env: "ACME_JIRA_EMAIL".to_owned(),
+                    api_token_env: "ACME_JIRA_API_TOKEN".to_owned(),
+                    email_value: None,
+                    api_token_value: None,
+                    enabled: true,
+                }],
+            },
+        )
+        .expect("save config");
+
+        let exported =
+            export_config_to_dir(config_path, downloads_path.clone()).expect("export config");
+        let backup = PathBuf::from(exported.path);
+        let contents = fs::read_to_string(&backup).expect("backup content");
+
+        assert_eq!(backup.parent(), Some(downloads_path.as_path()));
+        assert!(contents.contains("initial_backfill_from_month = \"05.2026\""));
+        assert!(!contents.contains("secret-token"));
     }
 }

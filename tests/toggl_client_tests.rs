@@ -17,6 +17,7 @@ fn client_config(base_url: String) -> TogglClientConfig {
         workspace_id: 700001,
         api_token: "fake-toggl-token-do-not-log".to_owned(),
         max_rps: 1.0,
+        initial_backfill_from_month: None,
         initial_backfill_days: 90,
     }
 }
@@ -352,6 +353,7 @@ fn toggl_client_rejects_insecure_non_local_base_urls_before_sending_token() {
         workspace_id: 700001,
         api_token: "fake-toggl-token-do-not-log".to_owned(),
         max_rps: 1.0,
+        initial_backfill_from_month: None,
         initial_backfill_days: 90,
     };
 
@@ -369,6 +371,7 @@ fn toggl_client_rejects_base_urls_with_embedded_credentials() {
         workspace_id: 700001,
         api_token: "fake-toggl-token-do-not-log".to_owned(),
         max_rps: 1.0,
+        initial_backfill_from_month: None,
         initial_backfill_days: 90,
     };
 

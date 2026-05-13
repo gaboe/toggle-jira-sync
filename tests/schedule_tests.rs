@@ -128,6 +128,12 @@ fn schedule_install_writes_os_job_file() {
             .any(|path| path.contains("toggl-jira-sync") || path.contains("com.toggl-jira-sync")),
         "expected scheduler file in {files:?}"
     );
+    for file in files {
+        let contents = fs::read_to_string(&file).expect("scheduler file should be readable");
+        if contents.contains(" sync ") {
+            assert!(contents.contains("--cleanup-deleted"), "{contents}");
+        }
+    }
 }
 
 fn walk_files(path: &std::path::Path) -> Vec<String> {

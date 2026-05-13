@@ -1,6 +1,7 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { createEffect, createMemo, createSignal, For, Match, onCleanup, onMount, Show, Switch } from "solid-js";
 import { render } from "solid-js/web";
+import toast, { Toaster } from "solid-toast";
 import "./styles.css";
 
 const backgroundSyncIntervalMs = 60 * 60 * 1000;
@@ -49,6 +50,18 @@ function monthLabel(key) {
   return new Intl.DateTimeFormat(undefined, { month: "long", year: "numeric" }).format(new Date(year, month - 1, 1));
 }
 
+function configMonthToInput(value) {
+  const match = /^(\d{2})\.(\d{4})$/.exec(value || "");
+  if (!match) return "";
+  return `${match[2]}-${match[1]}`;
+}
+
+function inputMonthToConfig(value) {
+  const match = /^(\d{4})-(\d{2})$/.exec(value || "");
+  if (!match) return null;
+  return `${match[2]}.${match[1]}`;
+}
+
 function scheduleText(schedule, nextBackgroundSyncAt) {
   if (!schedule.enabled) return "OS schedule off";
   const interval = `${schedule.interval_minutes}m`;
@@ -68,7 +81,7 @@ function App() {
   const [selected, setSelected] = createSignal(0);
   const [issueFilter, setIssueFilter] = createSignal("");
   const [dateFilter, setDateFilter] = createSignal("");
-  const [message, setMessage] = createSignal("Loading sync state…");
+  const [loadError, setLoadError] = createSignal("");
   const [busyCommand, setBusyCommand] = createSignal(null);
   const [now, setNow] = createSignal(Date.now());
   const [guiBackgroundSyncEnabled, setGuiBackgroundSyncEnabled] = createSignal(true);
@@ -133,17 +146,18 @@ function App() {
   });
 
   async function refresh() {
-    setMessage("Loading sync state…");
     try {
       setSnapshot(await tauriInvoke("snapshot"));
-      setMessage("Ready.");
+      setLoadError("");
     } catch (error) {
       try {
         const fallback = await tauriInvoke("config_snapshot");
         setSnapshot({ ...fallback, status: { summary: { total_count: 0, synced_count: 0, skipped_count: 0, error_count: 0 }, entries: [] } });
-        setMessage(`Sync state unavailable: ${String(error)}`);
+        setLoadError("");
+        toast.error(`Sync state unavailable: ${String(error)}`);
       } catch (configError) {
-        setMessage(`Configuration unavailable: ${String(configError)}`);
+        setLoadError(`Configuration unavailable: ${String(configError)}`);
+        toast.error(`Configuration unavailable: ${String(configError)}`);
       }
     }
   }
@@ -151,14 +165,16 @@ function App() {
   async function runAction(label, command) {
     if (busyCommand()) return;
     const startedAt = performance.now();
+    const loadingToast = toast.loading(`Running ${label}…`);
     setBusyCommand(command);
-    setMessage(`Running ${label}…`);
     try {
       setSnapshot(await tauriInvoke(command));
       await waitForMinimumBusy(startedAt);
-      setMessage(`${label} finished.`);
+      toast.dismiss(loadingToast);
+      toast.success(`${label} finished.`);
     } catch (error) {
-      setMessage(String(error));
+      toast.dismiss(loadingToast);
+      toast.error(String(error));
     } finally {
       setBusyCommand(null);
     }
@@ -174,7 +190,9 @@ function App() {
       toggl_api_token_env: form.toggl_api_token_env.value.trim(),
       toggl_api_token_value: form.toggl_api_token_value.value.trim() || null,
       sqlite_path: form.sqlite_path.value.trim(),
+      initial_backfill_from_month: inputMonthToConfig(form.initial_backfill_from_month.value),
       initial_backfill_days: Number(form.initial_backfill_days.value),
+      recovery_from_month: inputMonthToConfig(form.recovery_from_month.value),
       recovery_scan_days: Number(form.recovery_scan_days.value),
       schedule_enabled: form.schedule_enabled.checked,
       schedule_interval_minutes: Number(form.schedule_interval_minutes.value),
@@ -191,30 +209,64 @@ function App() {
         ...(current?.jira_sites || []).slice(1),
       ],
     };
-    setMessage("Saving configuration…");
-    await tauriInvoke("save_config", { update });
-    await refresh();
-    setMessage("Configuration saved.");
+    const loadingToast = toast.loading("Saving configuration…");
+    try {
+      await tauriInvoke("save_config", { update });
+      await refresh();
+      toast.dismiss(loadingToast);
+      toast.success("Configuration saved.");
+    } catch (error) {
+      toast.dismiss(loadingToast);
+      toast.error(String(error));
+    }
   }
 
   async function deleteLocalData() {
     if (!window.confirm("Delete the local SQLite sync data? Config and saved credentials stay in place.")) return;
-    setMessage("Deleting local sync data…");
-    const result = await tauriInvoke("delete_local_data");
-    await refresh();
-    setMessage(result.deleted ? `Deleted local sync data: ${result.path}` : `No local sync data found: ${result.path}`);
+    const loadingToast = toast.loading("Deleting local sync data…");
+    try {
+      const result = await tauriInvoke("delete_local_data");
+      await refresh();
+      toast.dismiss(loadingToast);
+      toast.success(result.deleted ? `Deleted local sync data: ${result.path}` : `No local sync data found: ${result.path}`);
+    } catch (error) {
+      toast.dismiss(loadingToast);
+      toast.error(String(error));
+    }
+  }
+
+  async function exportConfig() {
+    const loadingToast = toast.loading("Exporting configuration…");
+    try {
+      const result = await tauriInvoke("export_config");
+      toast.dismiss(loadingToast);
+      toast.custom(
+        (toastState) => (
+          <div class="export-toast">
+            <div>
+              <strong>Configuration exported</strong>
+              <p>{result.path}</p>
+            </div>
+            <button type="button" onClick={() => { openUrl(result.path); toast.dismiss(toastState.id); }}>Open</button>
+          </div>
+        ),
+        { duration: 8000, position: "top-right" },
+      );
+    } catch (error) {
+      toast.dismiss(loadingToast);
+      toast.error(`Export failed: ${String(error)}`);
+    }
   }
 
   async function openUrl(url) {
     if (!url) return;
-    await tauriInvoke("open_url", { url }).catch((error) => setMessage(String(error)));
+    await tauriInvoke("open_url", { url }).catch((error) => toast.error(String(error)));
   }
 
   return (
-    <AppShell
-      view={view()}
-      setView={setView}
-      message={message()}
+      <AppShell
+        view={view()}
+        setView={setView}
       actions={
         <>
           <ActionButton label="Preview changes" command="dry_run" busyCommand={busyCommand()} onClick={() => runAction("dry-run", "dry_run")} secondary description="No Jira writes" />
@@ -237,7 +289,6 @@ function App() {
                 setDateFilter={setDateFilter}
                 setSelected={setSelected}
                 openUrl={openUrl}
-                message={message()}
                 scheduleText={scheduleText(schedule(), nextBackgroundSyncAt())}
                 months={months()}
                 activeMonth={activeMonth()}
@@ -247,8 +298,8 @@ function App() {
           </Match>
           <Match when={view() === "configuration"}>
             <section class="view-surface">
-              <Show when={config()} fallback={<div class="panel empty-detail">{message()}</div>}>
-                <Configuration config={config()} guiBackgroundSyncEnabled={guiBackgroundSyncEnabled()} saveConfig={saveConfig} deleteLocalData={deleteLocalData} />
+              <Show when={config()} fallback={<div class="panel empty-detail">{loadError() || "Loading configuration…"}</div>}>
+                <Configuration config={config()} guiBackgroundSyncEnabled={guiBackgroundSyncEnabled()} saveConfig={saveConfig} deleteLocalData={deleteLocalData} exportConfig={exportConfig} />
               </Show>
             </section>
           </Match>
@@ -260,10 +311,10 @@ function App() {
 function AppShell(props) {
   return (
     <div class="app-shell">
+      <Toaster position="top-right" gutter={10} />
       <TopBar title={props.view === "configuration" ? "Configuration" : "Worklog overview"} actions={props.actions} />
       <NavTabs view={props.view} setView={props.setView} />
       <main class="workspace">{props.children}</main>
-      <footer aria-live="polite">{props.message}</footer>
     </div>
   );
 }
@@ -300,9 +351,6 @@ function Overview(props) {
   const nextMonth = () => props.months[activeMonthIndex() - 1];
   return (
     <>
-      <div class="status-strip" aria-live="polite">
-        <span>{props.message}</span>
-      </div>
       <SummaryMetrics summary={props.summary} />
       <div class="worklog-layout">
         <section class="panel worklog-list">
@@ -448,13 +496,14 @@ function Configuration(props) {
   const [showJiraToken, setShowJiraToken] = createSignal(false);
   return (
     <form class="panel config-grid" onSubmit={props.saveConfig}>
-      <div class="panel-head full"><div><h2>Configuration</h2><p>{props.config.path}</p></div><div class="config-actions"><button class="danger" type="button" onClick={props.deleteLocalData}>Delete local data</button><button class="primary" type="submit">Save configuration</button></div></div>
+      <div class="panel-head full"><div><h2>Configuration</h2><p>{props.config.path}</p></div><div class="config-actions"><button class="secondary" type="button" onClick={props.exportConfig}>Export configuration</button><button class="danger" type="button" onClick={props.deleteLocalData}>Delete local data</button><button class="primary" type="submit">Save configuration</button></div></div>
       <label>Workspace ID <input name="toggl_workspace_id" type="number" value={props.config.toggl_workspace_id} required /></label>
-      <label>Toggl token env <input name="toggl_api_token_env" value={props.config.toggl_api_token_env} required /></label>
+      <input type="hidden" name="toggl_api_token_env" value={props.config.toggl_api_token_env || "TOGGL_API_TOKEN"} />
       <SecretField label="Toggl API token" name="toggl_api_token_value" value={props.config.toggl_api_token_value || ""} visible={showTogglToken()} setVisible={setShowTogglToken} placeholder={props.config.toggl_api_token_present ? "Token saved; leave blank to keep it" : "Paste Toggl API token"} />
       <label>SQLite path <input name="sqlite_path" value={props.config.sqlite_path} required /></label>
-      <label>Initial backfill days <input name="initial_backfill_days" type="number" min="1" value={props.config.initial_backfill_days} required /></label>
-      <label>Recovery scan days <input name="recovery_scan_days" type="number" min="1" value={props.config.recovery_scan_days} required /></label>
+      <label>Initial sync from month <input name="initial_backfill_from_month" type="month" value={configMonthToInput(props.config.initial_backfill_from_month)} /></label>
+      <label>Recovery scan from month <input name="recovery_from_month" type="month" value={configMonthToInput(props.config.recovery_from_month)} /></label>
+      <details class="advanced-config full"><summary>Advanced day-count fallback</summary><div class="advanced-grid"><label>Initial backfill days <input name="initial_backfill_days" type="number" min="1" value={props.config.initial_backfill_days} required /></label><label>Recovery scan days <input name="recovery_scan_days" type="number" min="1" value={props.config.recovery_scan_days} required /></label></div><p>Used only when the matching month field is empty. Month values use the first day of that month.</p></details>
       <label>Schedule interval minutes <input name="schedule_interval_minutes" type="number" min="1" value={props.config.schedule_interval_minutes} required /></label>
       <label class="check"><input name="schedule_enabled" type="checkbox" checked={props.config.schedule_enabled} /> Enable OS schedule</label>
       <label class="check"><input name="gui_background_sync_enabled" type="checkbox" checked={props.guiBackgroundSyncEnabled} /> Sync hourly while this app is open</label>

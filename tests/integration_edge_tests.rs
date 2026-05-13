@@ -577,6 +577,7 @@ async fn integration_edge_large_initial_backfill_uses_bounded_pages_windows() {
         workspace_id: WORKSPACE_ID.parse().expect("numeric workspace id"),
         api_token: "fake-toggl-token-do-not-log".to_owned(),
         max_rps: 1.0,
+        initial_backfill_from_month: None,
         initial_backfill_days: 14,
     })
     .expect("toggl client config should be valid");

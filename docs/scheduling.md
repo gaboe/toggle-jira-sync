@@ -59,6 +59,8 @@ api_token_env = "TOGGL_API_TOKEN"
 
 [runtime]
 sqlite_path = "toggl-jira-sync.sqlite"
+initial_backfill_from_month = "05.2026"
+recovery_from_month = "05.2026"
 
 [schedule]
 enabled = true

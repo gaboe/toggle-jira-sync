@@ -313,6 +313,10 @@ fn record_toggl_entry_ledgers(
             stopped_at: stopped_at(entry).as_deref(),
         })?;
 
+        if entry.deleted_at.is_some() {
+            database.mark_toggl_entry_deleted(&entry.workspace_id, &entry.entry_id)?;
+        }
+
         if let Some(PlannerOutcome::Error(issue)) = outcome {
             let attempt_issue_key = planner_issue_key(issue);
             database.insert_sync_attempt(&crate::db::NewSyncAttempt {

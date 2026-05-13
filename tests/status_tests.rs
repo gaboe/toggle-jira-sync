@@ -109,6 +109,67 @@ api_token_env = "JIRA_STATUS_TEST_TOKEN"
 }
 
 #[test]
+fn status_hides_deleted_toggl_entries() {
+    let temp = TempDir::new().expect("temp dir should be created");
+    let db_path = temp.path().join("ledger.sqlite");
+    let config_path = temp.path().join("config.toml");
+
+    fs::write(
+        &config_path,
+        r#"
+[toggl]
+workspace_id = 123
+api_token_env = "TOGGL_STATUS_TEST_TOKEN"
+
+[[jira.sites]]
+key = "sabservis"
+base_url = "https://example.atlassian.net"
+email_env = "JIRA_STATUS_TEST_EMAIL"
+api_token_env = "JIRA_STATUS_TEST_TOKEN"
+"#,
+    )
+    .expect("config should be written");
+
+    let db = Database::open(&db_path).expect("db should open");
+    db.run_migrations().expect("migrations should run");
+    db.upsert_toggl_entry(&NewTogglEntry {
+        toggl_workspace_id: "123",
+        toggl_entry_id: "deleted-entry",
+        description: Some("CORE-224 deleted work"),
+        extracted_issue_key: Some("CORE-224"),
+        source_hash: "sha256:deleted",
+        rounded_duration_seconds: 0,
+        status: "planned",
+        started_at: Some("2026-05-13T13:10:00Z"),
+        stopped_at: Some("2026-05-13T13:10:00Z"),
+    })
+    .expect("toggl entry should insert");
+    db.mark_toggl_entry_deleted("123", "deleted-entry")
+        .expect("toggl entry should be marked deleted");
+
+    let output = Command::new(binary())
+        .args([
+            "status",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--db",
+            db_path.to_str().expect("db path should be utf8"),
+            "--json",
+        ])
+        .output()
+        .expect("status should run");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("deleted-entry"), "{stdout}");
+    assert!(!stdout.contains("CORE-224"), "{stdout}");
+}
+
+#[test]
 fn status_human_output_formats_time_and_duration_readably() {
     let temp = TempDir::new().expect("temp dir should be created");
     let db_path = temp.path().join("ledger.sqlite");
