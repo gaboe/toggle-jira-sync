@@ -38,18 +38,20 @@ async fn setup_config(args: ConfigSetupArgs) -> anyhow::Result<()> {
     let config_path = resolve_config_path(args.config)?;
     let credentials_path = resolve_credentials_path(args.credentials)?;
 
-    let input = SetupInput::prompt().await?;
-    let site_env_prefix = env_prefix_for_site_key(&input.site_key)?;
-    let jira_email_env = format!("{site_env_prefix}_JIRA_EMAIL");
-    let jira_api_token_env = format!("{site_env_prefix}_JIRA_API_TOKEN");
+    let mut input = SetupInput::prompt().await?;
+    for site in &mut input.jira_sites {
+        let site_env_prefix = env_prefix_for_site_key(&site.site_key)?;
+        site.jira_email_env = format!("{site_env_prefix}_JIRA_EMAIL");
+        site.jira_api_token_env = format!("{site_env_prefix}_JIRA_API_TOKEN");
+    }
 
-    let config_text = render_config(&input, &jira_email_env, &jira_api_token_env);
+    let config_text = render_config(&input);
     AppConfig::from_toml_str(&config_text).context("generated config failed validation")?;
 
     write_file(&config_path, &config_text)
         .with_context(|| format!("failed to write config file {}", config_path.display()))?;
 
-    let credentials_text = render_credentials(&input, &jira_email_env, &jira_api_token_env);
+    let credentials_text = render_credentials(&input);
     write_secret_file(&credentials_path, &credentials_text).with_context(|| {
         format!(
             "failed to write credentials file {}",
@@ -166,12 +168,19 @@ fn validate_config(args: ConfigValidateArgs) -> anyhow::Result<()> {
 struct SetupInput {
     toggl_workspace_id: i64,
     toggl_api_token: String,
+    jira_sites: Vec<SetupJiraSiteInput>,
+    sqlite_path: String,
+    schedule_interval_minutes: u32,
+}
+
+#[derive(Debug)]
+struct SetupJiraSiteInput {
     site_key: String,
     jira_base_url: String,
     jira_email: String,
     jira_api_token: String,
-    sqlite_path: String,
-    schedule_interval_minutes: u32,
+    jira_email_env: String,
+    jira_api_token_env: String,
 }
 
 impl SetupInput {
@@ -205,21 +214,33 @@ impl SetupInput {
                 },
             )?
         };
-        let jira_base_url = read_required("Jira site URL")?;
-        let site_key = derive_jira_site_key(&jira_base_url)?;
-        println!("Using Jira site key: {site_key}");
-        let jira_email = read_required("Jira email")?;
-        let jira_api_token = read_required("Jira API token")?;
+        let mut jira_sites = Vec::new();
+        loop {
+            let jira_base_url = read_required("Jira site URL")?;
+            let site_key = derive_jira_site_key(&jira_base_url)?;
+            println!("Using Jira site key: {site_key}");
+            let jira_email = read_required("Jira email")?;
+            let jira_api_token = read_required("Jira API token")?;
+            jira_sites.push(SetupJiraSiteInput {
+                site_key,
+                jira_base_url,
+                jira_email,
+                jira_api_token,
+                jira_email_env: String::new(),
+                jira_api_token_env: String::new(),
+            });
+
+            if !read_yes_no("Add another Jira site?", false)? {
+                break;
+            }
+        }
         let sqlite_path = DEFAULT_SQLITE_PATH.to_owned();
         let schedule_interval_minutes = 60;
 
         Ok(Self {
             toggl_workspace_id,
             toggl_api_token,
-            site_key,
-            jira_base_url,
-            jira_email,
-            jira_api_token,
+            jira_sites,
             sqlite_path,
             schedule_interval_minutes,
         })
@@ -255,11 +276,17 @@ impl LocalCredentials {
 
 pub(crate) fn load_default_credentials() -> anyhow::Result<LocalCredentials> {
     let credentials_path = resolve_credentials_path(None)?;
+    load_credentials_from_path(&credentials_path)
+}
+
+pub(crate) fn load_credentials_from_path(
+    credentials_path: &Path,
+) -> anyhow::Result<LocalCredentials> {
     if !credentials_path.exists() {
         return Ok(LocalCredentials::default());
     }
 
-    let values = read_credentials(&credentials_path)
+    let values = read_credentials(credentials_path)
         .with_context(|| format!("failed to read credentials {}", credentials_path.display()))?
         .into_iter()
         .collect();
@@ -291,7 +318,7 @@ pub(crate) fn resolve_db_path(
     }
 }
 
-fn resolve_credentials_path(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_credentials_path(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     path.map(Ok)
         .unwrap_or_else(|| default_config_dir().map(|dir| dir.join(DEFAULT_CREDENTIALS_FILE)))
 }
@@ -334,6 +361,23 @@ fn read_required(prompt: &str) -> anyhow::Result<String> {
     }
 
     Ok(value)
+}
+
+fn read_yes_no(prompt: &str, default: bool) -> anyhow::Result<bool> {
+    let default_hint = if default { "Y/n" } else { "y/N" };
+    print!("{prompt} [{default_hint}]: ");
+    io::stdout().flush().context("failed to flush prompt")?;
+
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .with_context(|| format!("failed to read {prompt}"))?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(default),
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => bail!("{prompt} must be y or n"),
+    }
 }
 
 fn read_required_from<R: BufRead, W: Write>(
@@ -515,34 +559,44 @@ fn derive_jira_site_key(jira_base_url: &str) -> anyhow::Result<String> {
     Ok(key)
 }
 
-fn render_config(input: &SetupInput, jira_email_env: &str, jira_api_token_env: &str) -> String {
-    format!(
-        "[toggl]\nworkspace_id = {}\napi_token_env = \"{}\"\n\n[runtime]\nsqlite_path = \"{}\"\n\n[schedule]\nenabled = true\ninterval_minutes = {}\n\n[jira]\n\n[[jira.sites]]\nkey = \"{}\"\nbase_url = \"{}\"\nemail_env = \"{}\"\napi_token_env = \"{}\"\nenabled = true\n",
+fn render_config(input: &SetupInput) -> String {
+    let mut contents = format!(
+        "[toggl]\nworkspace_id = {}\napi_token_env = \"{}\"\n\n[runtime]\nsqlite_path = \"{}\"\n\n[schedule]\nenabled = true\ninterval_minutes = {}\n\n[jira]\n",
         input.toggl_workspace_id,
         TOGGL_API_TOKEN_ENV,
         toml_escape(&input.sqlite_path),
         input.schedule_interval_minutes,
-        toml_escape(&input.site_key),
-        toml_escape(&input.jira_base_url),
-        jira_email_env,
-        jira_api_token_env,
-    )
+    );
+
+    for site in &input.jira_sites {
+        contents.push_str(&format!(
+            "\n[[jira.sites]]\nkey = \"{}\"\nbase_url = \"{}\"\nemail_env = \"{}\"\napi_token_env = \"{}\"\nenabled = true\n",
+            toml_escape(&site.site_key),
+            toml_escape(&site.jira_base_url),
+            site.jira_email_env,
+            site.jira_api_token_env,
+        ));
+    }
+
+    contents
 }
 
-fn render_credentials(
-    input: &SetupInput,
-    jira_email_env: &str,
-    jira_api_token_env: &str,
-) -> String {
-    format!(
-        "{}={}\n{}={}\n{}={}\n",
+fn render_credentials(input: &SetupInput) -> String {
+    let mut contents = format!(
+        "{}={}\n",
         TOGGL_API_TOKEN_ENV,
         env_escape(&input.toggl_api_token),
-        jira_email_env,
-        env_escape(&input.jira_email),
-        jira_api_token_env,
-        env_escape(&input.jira_api_token),
-    )
+    );
+    for site in &input.jira_sites {
+        contents.push_str(&format!(
+            "{}={}\n{}={}\n",
+            site.jira_email_env,
+            env_escape(&site.jira_email),
+            site.jira_api_token_env,
+            env_escape(&site.jira_api_token),
+        ));
+    }
+    contents
 }
 
 fn write_file(path: &Path, contents: &str) -> io::Result<()> {

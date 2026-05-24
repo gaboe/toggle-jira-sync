@@ -1,5 +1,6 @@
 use std::process::Command;
 
+use tauri::Manager;
 use toggl_jira_sync::{
     app::{self, AppStateSnapshot, ConfigOnlySnapshot, ConfigSnapshot, ConfigUpdate, DeleteLocalDataResult, ExportConfigResult, ScheduleSnapshot},
     cli::SharedPaths,
@@ -102,6 +103,40 @@ fn format_tauri_error(error: anyhow::Error) -> String {
 
 fn main() {
     tauri::Builder::default()
+        .setup(|app| {
+            let listener = tauri::async_runtime::block_on(toggl_jira_sync::server::bind(
+                "127.0.0.1",
+                0,
+            ))
+            .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
+            let local_addr = listener
+                .local_addr()
+                .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
+            let api_base_url = format!("http://{local_addr}");
+
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = toggl_jira_sync::server::serve_listener(
+                    listener,
+                    default_paths(),
+                    None,
+                    STATUS_LIMIT,
+                    toggl_jira_sync::cli::ServerMode::Single,
+                    None,
+                )
+                .await
+                {
+                    eprintln!("embedded server failed: {error}");
+                }
+            });
+
+            if let Some(window) = app.get_webview_window("main") {
+                window.eval(&format!(
+                    "window.__TJS_API_BASE_URL__ = {};",
+                    serde_json::to_string(&api_base_url)?
+                ))?;
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             snapshot,
             config_snapshot,

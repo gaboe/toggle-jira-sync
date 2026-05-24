@@ -5,7 +5,8 @@ use anyhow::Context;
 use crate::{
     cli::SyncArgs,
     commands::config::{
-        load_default_credentials, resolve_config_path, resolve_db_path, LocalCredentials,
+        load_credentials_from_path, load_default_credentials, resolve_config_path, resolve_db_path,
+        LocalCredentials,
     },
     config::{AppConfig, JiraSiteConfig},
     db::{Database, NewSyncRun, NewTogglEntry, StoredJiraWorklogLink},
@@ -24,11 +25,31 @@ use crate::{
 };
 
 pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
-    let config_path = resolve_config_path(args.paths.config)?;
+    let config_path = resolve_config_path(args.paths.config.clone())?;
+    let credentials = None;
+    run_with_config(args, config_path, credentials).await
+}
+
+pub async fn run_with_credentials(
+    args: SyncArgs,
+    credentials_path: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    let config_path = resolve_config_path(args.paths.config.clone())?;
+    let credentials = Some(load_credentials_from_path(&credentials_path)?);
+    run_with_config(args, config_path, credentials).await
+}
+
+async fn run_with_config(
+    args: SyncArgs,
+    config_path: std::path::PathBuf,
+    credentials: Option<LocalCredentials>,
+) -> anyhow::Result<()> {
     let uses_default_config = config_path == resolve_config_path(None)?;
     let config = AppConfig::from_path(&config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
-    let credentials = if uses_default_config {
+    let credentials = if let Some(credentials) = credentials {
+        credentials
+    } else if uses_default_config {
         load_default_credentials()?
     } else {
         LocalCredentials::default()

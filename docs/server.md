@@ -1,0 +1,46 @@
+# Server modes
+
+`toggl-jira-sync server` exposes the shared app API over HTTP for web and desktop clients.
+
+## Single mode
+
+Single mode is the default local mode. It uses the same config, credentials, and SQLite ledger resolution as the CLI and TUI.
+
+```sh
+toggl-jira-sync server --mode single --host 127.0.0.1 --port 8787
+```
+
+Use `--config`, `--credentials`, and `--db` together when running against non-default local files.
+
+Routes are unscoped under `/api`, for example `/api/snapshot`, `/api/config`, `/api/status`, `/api/sync/dry-run`, and `/api/sync`. Keep the default host on `127.0.0.1` unless a reverse proxy or other authentication boundary protects the server.
+
+## Multi mode
+
+Multi mode is a minimal SaaS foundation. It requires a tenant metadata SQLite database and bearer tokens mapped to exactly one tenant.
+
+```sh
+toggl-jira-sync server --mode multi --tenant-db ./tenants.sqlite --host 127.0.0.1 --port 8787
+```
+
+Each tenant row points to its own config file, credentials file, and sync SQLite ledger. Tenant API tokens are stored as SHA-256 hashes. Multi mode never uses the default local config or credentials file for tenant requests. HTTP responses expose credential presence only; raw Toggl and Jira credential values are not returned by the server API.
+
+Tenant routes are scoped and require `Authorization: Bearer <token>`:
+
+```text
+GET  /api/me
+GET  /api/tenants/{tenant_id}/snapshot
+GET  /api/tenants/{tenant_id}/config
+GET  /api/tenants/{tenant_id}/status
+POST /api/tenants/{tenant_id}/sync/dry-run
+POST /api/tenants/{tenant_id}/sync
+```
+
+A token for tenant `a` cannot access tenant `b`; mismatches return `403`. Missing or invalid tokens return `401`.
+
+Multi mode intentionally does not include public signup, billing, OAuth, organization management, an admin portal, cross-tenant reporting, tenant config editing, local data deletion, or config export. Add those only after the secret-storage and audit model is designed.
+
+## Deployment guardrails
+
+For Docker or customer-hosted deployments, mount config, credentials, tenant metadata, and SQLite ledgers as volumes. Do not bake credentials into the image.
+
+SQLite is acceptable for single-tenant and small self-hosted multi-tenant deployments when each tenant has a separate ledger file. If the service becomes high-concurrency or centrally hosted for many customers, move the tenant metadata and sync ledgers to PostgreSQL before adding public SaaS features.

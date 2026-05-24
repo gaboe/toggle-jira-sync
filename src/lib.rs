@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod jira;
 pub mod report;
+pub mod server;
 pub mod sync;
 pub mod time;
 pub mod toggl;
@@ -18,6 +19,7 @@ pub async fn run(cli: cli::Cli) -> anyhow::Result<()> {
         Some(cli::Command::Status(args)) => commands::status::run(args).await,
         Some(cli::Command::Tui(args)) => commands::tui::run(args).await,
         Some(cli::Command::Schedule(args)) => commands::schedule::run(args),
+        Some(cli::Command::Server(args)) => server::run(args).await,
         None => {
             commands::tui::run(cli::TuiArgs {
                 paths: cli::SharedPaths {

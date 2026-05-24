@@ -180,19 +180,18 @@ fn integration_edge_no_issue_key_skips_without_jira_mutation() {
 }
 
 #[test]
-fn integration_edge_multiple_issue_keys_errors_without_jira_mutation() {
+fn integration_edge_multiple_issue_keys_uses_only_resolved_key() {
     let plan = plan_sync(default_input(vec![entry(
         ENTRY_ID,
         "Touches SAB-123 and SAB-456",
     )]))
     .expect("planner should not fail globally");
 
-    assert!(plan.mutations.is_empty());
-    assert!(matches!(
-        &plan.entries[0].outcome,
-        PlannerOutcome::Error(PlannerIssue::MultipleIssueKeys { issue_keys })
-            if issue_keys == &vec!["SAB-123".to_owned(), "SAB-456".to_owned()]
-    ));
+    assert_eq!(plan.mutations.len(), 1);
+    let PlannedMutation::Create(create) = &plan.mutations[0] else {
+        panic!("expected create mutation, got {:?}", plan.mutations);
+    };
+    assert_eq!(create.jira_issue_key, ISSUE_KEY);
 }
 
 #[test]

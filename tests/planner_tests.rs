@@ -211,6 +211,25 @@ fn planner_multiple_issue_keys_reports_error_without_mutation() {
 }
 
 #[test]
+fn planner_multiple_issue_keys_uses_only_resolved_key() {
+    let plan = plan_sync(PlannerInput {
+        entries: vec![entry("900001", "Touches CORE-269, US-1")],
+        issue_site_mappings: vec![IssueSiteMapping {
+            issue_key: "CORE-269".to_owned(),
+            jira_site_key: "core".to_owned(),
+        }],
+        existing_links: Vec::new(),
+    })
+    .expect("planner should not fail globally");
+
+    assert_eq!(plan.mutations.len(), 1);
+    let PlannedMutation::Create(create) = &plan.mutations[0] else {
+        panic!("expected create mutation, got {:?}", plan.mutations);
+    };
+    assert_eq!(create.jira_issue_key, "CORE-269");
+}
+
+#[test]
 fn planner_unresolved_or_ambiguous_issue_site_reports_error_without_mutation() {
     let unknown = plan_sync(input(vec![entry("900001", "Unknown ABC-123")]))
         .expect("planner should not fail globally");

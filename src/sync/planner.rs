@@ -218,7 +218,7 @@ fn plan_entry(
     }
 
     let comment = entry.description.clone().unwrap_or_default();
-    let issue_key = match extract_single_issue_key(&comment) {
+    let issue_key = match select_issue_key(&comment, issue_sites) {
         Ok(issue_key) => issue_key,
         Err(outcome) => return (outcome, Vec::new()),
     };
@@ -341,15 +341,28 @@ pub fn extract_issue_keys(comment: &str) -> Vec<String> {
     issue_keys
 }
 
-fn extract_single_issue_key(comment: &str) -> Result<String, PlannerOutcome> {
-    let mut issue_keys = extract_issue_keys(comment);
+fn select_issue_key(
+    comment: &str,
+    issue_sites: &HashMap<String, Vec<String>>,
+) -> Result<String, PlannerOutcome> {
+    let issue_keys = extract_issue_keys(comment);
 
     match issue_keys.len() {
         0 => Err(PlannerOutcome::Skip(SkipCause::MissingIssueKey)),
-        1 => Ok(issue_keys.remove(0)),
-        _ => Err(PlannerOutcome::Error(PlannerIssue::MultipleIssueKeys {
-            issue_keys,
-        })),
+        1 => Ok(issue_keys[0].clone()),
+        _ => {
+            let resolved_issue_keys = issue_keys
+                .iter()
+                .filter(|issue_key| resolve_site_key(issue_key, issue_sites).is_ok())
+                .collect::<Vec<_>>();
+
+            match resolved_issue_keys.as_slice() {
+                [issue_key] => Ok((*issue_key).clone()),
+                _ => Err(PlannerOutcome::Error(PlannerIssue::MultipleIssueKeys {
+                    issue_keys,
+                })),
+            }
+        }
     }
 }
 

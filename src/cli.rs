@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = env!("CARGO_PKG_NAME"), version, about = "Mirror Toggl time entries into Jira worklogs")]
@@ -18,6 +18,7 @@ pub enum Command {
     Status(StatusArgs),
     Tui(TuiArgs),
     Schedule(ScheduleArgs),
+    Server(ServerArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -75,6 +76,36 @@ pub struct TuiArgs {
 
     #[arg(long, default_value_t = 200)]
     pub limit: usize,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ServerArgs {
+    #[command(flatten)]
+    pub paths: SharedPaths,
+
+    #[arg(long)]
+    pub credentials: Option<PathBuf>,
+
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    #[arg(long, default_value_t = 8787)]
+    pub port: u16,
+
+    #[arg(long, default_value_t = 200)]
+    pub limit: usize,
+
+    #[arg(long, value_enum, default_value_t = ServerMode::Single)]
+    pub mode: ServerMode,
+
+    #[arg(long)]
+    pub tenant_db: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ServerMode {
+    Single,
+    Multi,
 }
 
 #[derive(Debug, Args)]

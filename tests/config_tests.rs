@@ -357,6 +357,63 @@ fn config_setup_accepts_stdin_and_writes_config_and_credentials() {
 }
 
 #[test]
+fn config_setup_accepts_multiple_jira_sites_from_stdin() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let config_path = temp_dir.path().join("config.toml");
+    let credentials_path = temp_dir.path().join("local.credentials.env");
+
+    let mut child = Command::new(binary())
+        .args([
+            "config",
+            "setup",
+            "--config",
+            config_path.to_str().expect("utf-8 config path"),
+            "--credentials",
+            credentials_path.to_str().expect("utf-8 credentials path"),
+        ])
+        .env("TJS_SKIP_SCHEDULE_INSTALL", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run config setup");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"fake-toggl-token\n123456\nhttps://sabservis.atlassian.net\nuser@example.com\nfake-jira-token\ny\nhttps://blogic.atlassian.net\nblogic@example.com\nfake-blogic-token\nn\n")
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("setup output");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config = AppConfig::from_path(&config_path).expect("generated config should validate");
+    assert_eq!(config.enabled_jira_sites().len(), 2);
+
+    let config_text = fs::read_to_string(&config_path).expect("config file");
+    assert!(config_text.contains("key = \"sabservis\""), "{config_text}");
+    assert!(config_text.contains("key = \"blogic\""), "{config_text}");
+
+    let credentials_text = fs::read_to_string(&credentials_path).expect("credentials file");
+    assert!(
+        credentials_text.contains("SABSERVIS_JIRA_API_TOKEN=fake-jira-token"),
+        "{credentials_text}"
+    );
+    assert!(
+        credentials_text.contains("BLOGIC_JIRA_API_TOKEN=fake-blogic-token"),
+        "{credentials_text}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Add another Jira site? [y/N]:"), "{stdout}");
+}
+
+#[test]
 fn config_setup_without_paths_uses_default_home_based_locations() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let home_dir = temp_dir.path();

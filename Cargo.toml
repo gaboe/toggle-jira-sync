@@ -21,6 +21,7 @@ exclude = [
 
 [dependencies]
 anyhow = "1.0.98"
+axum = "0.7.9"
 chrono = { version = "0.4.41", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5.38", features = ["derive"] }
 crossterm = "0.28.1"
@@ -35,9 +36,12 @@ tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
 toml = "0.8.22"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+tower-http = { version = "0.6.8", features = ["cors"] }
 unicode-width = "0.2.0"
 
 [dev-dependencies]
 base64 = "0.22.1"
 httpmock = "0.7.0"
+http-body-util = "0.1.3"
 tempfile = "3.19.1"
+tower = "0.5.3"

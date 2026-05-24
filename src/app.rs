@@ -50,6 +50,20 @@ pub struct ConfigSnapshot {
     pub jira_sites: Vec<JiraSiteSnapshot>,
 }
 
+impl ConfigOnlySnapshot {
+    pub fn redacted(mut self) -> Self {
+        self.config.redact_secrets();
+        self
+    }
+}
+
+impl AppStateSnapshot {
+    pub fn redacted(mut self) -> Self {
+        self.config.redact_secrets();
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeleteLocalDataResult {
     pub deleted: bool,
@@ -101,8 +115,16 @@ pub struct JiraSiteUpdate {
 }
 
 pub fn snapshot(paths: SharedPaths, limit: usize) -> anyhow::Result<AppStateSnapshot> {
+    snapshot_with_credentials(paths, limit, None)
+}
+
+pub fn snapshot_with_credentials(
+    paths: SharedPaths,
+    limit: usize,
+    credentials_path: Option<PathBuf>,
+) -> anyhow::Result<AppStateSnapshot> {
     let (config_path, config, status) = status_report(paths, limit)?;
-    let credentials = read_default_credentials().unwrap_or_default();
+    let credentials = read_credentials_for_config(&config_path, credentials_path)?;
     Ok(AppStateSnapshot {
         schedule: ScheduleSnapshot {
             enabled: config.schedule.enabled,
@@ -114,10 +136,17 @@ pub fn snapshot(paths: SharedPaths, limit: usize) -> anyhow::Result<AppStateSnap
 }
 
 pub fn config_snapshot(paths: SharedPaths) -> anyhow::Result<ConfigOnlySnapshot> {
+    config_snapshot_with_credentials(paths, None)
+}
+
+pub fn config_snapshot_with_credentials(
+    paths: SharedPaths,
+    credentials_path: Option<PathBuf>,
+) -> anyhow::Result<ConfigOnlySnapshot> {
     let config_path = resolve_config_path(paths.config)?;
     let config = AppConfig::from_path(&config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
-    let credentials = read_default_credentials().unwrap_or_default();
+    let credentials = read_credentials_for_config(&config_path, credentials_path)?;
     Ok(ConfigOnlySnapshot {
         schedule: ScheduleSnapshot {
             enabled: config.schedule.enabled,
@@ -158,14 +187,26 @@ pub async fn run_sync(
     dry_run: bool,
     _cleanup_deleted: bool,
 ) -> anyhow::Result<()> {
-    crate::commands::sync::run(SyncArgs {
+    run_sync_with_credentials(paths, dry_run, _cleanup_deleted, None).await
+}
+
+pub async fn run_sync_with_credentials(
+    paths: SharedPaths,
+    dry_run: bool,
+    _cleanup_deleted: bool,
+    credentials_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let args = SyncArgs {
         paths,
         dry_run,
         cleanup_deleted: true,
         json: false,
         quiet: true,
-    })
-    .await
+    };
+    if let Some(credentials_path) = credentials_path {
+        return crate::commands::sync::run_with_credentials(args, credentials_path).await;
+    }
+    crate::commands::sync::run(SyncArgs { ..args }).await
 }
 
 pub fn update_schedule(paths: SharedPaths, enabled: bool) -> anyhow::Result<ScheduleSnapshot> {
@@ -280,6 +321,14 @@ pub fn jira_base_urls(config: &AppConfig) -> HashMap<String, String> {
 }
 
 impl ConfigSnapshot {
+    pub fn redact_secrets(&mut self) {
+        self.toggl_api_token_value = None;
+        for site in &mut self.jira_sites {
+            site.email_value = None;
+            site.api_token_value = None;
+        }
+    }
+
     fn from_config(
         path: PathBuf,
         config: &AppConfig,
@@ -377,6 +426,23 @@ fn default_credentials_path() -> anyhow::Result<PathBuf> {
 
 fn read_default_credentials() -> anyhow::Result<HashMap<String, String>> {
     let path = default_credentials_path()?;
+    read_credentials_from_path(path)
+}
+
+fn read_credentials_for_config(
+    config_path: &PathBuf,
+    credentials_path: Option<PathBuf>,
+) -> anyhow::Result<HashMap<String, String>> {
+    if let Some(path) = credentials_path {
+        return read_credentials_from_path(path);
+    }
+    if *config_path == resolve_config_path(None)? {
+        return read_default_credentials();
+    }
+    Ok(HashMap::new())
+}
+
+fn read_credentials_from_path(path: PathBuf) -> anyhow::Result<HashMap<String, String>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
@@ -478,6 +544,42 @@ fn render_optional_string(key: &str, value: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{Database, NewJiraWorklogLink, NewTogglEntry};
+
+    fn sample_update(sqlite_path: String) -> ConfigUpdate {
+        ConfigUpdate {
+            toggl_workspace_id: 123,
+            toggl_api_token_env: "TOGGL_API_TOKEN".to_owned(),
+            toggl_api_token_value: None,
+            sqlite_path,
+            initial_backfill_from_month: Some("05.2026".to_owned()),
+            initial_backfill_days: 90,
+            recovery_from_month: None,
+            recovery_scan_days: 180,
+            schedule_enabled: true,
+            schedule_interval_minutes: 60,
+            jira_sites: vec![JiraSiteUpdate {
+                key: "acme".to_owned(),
+                base_url: "https://acme.atlassian.net".to_owned(),
+                email_env: "ACME_JIRA_EMAIL".to_owned(),
+                api_token_env: "ACME_JIRA_API_TOKEN".to_owned(),
+                email_value: None,
+                api_token_value: None,
+                enabled: true,
+            }],
+        }
+    }
+
+    fn write_sample_config(config_path: &std::path::Path, sqlite_path: &str) {
+        save_config(
+            SharedPaths {
+                config: Some(config_path.to_path_buf()),
+                db: None,
+            },
+            sample_update(sqlite_path.to_owned()),
+        )
+        .expect("save config");
+    }
 
     #[test]
     fn save_config_writes_valid_config() {
@@ -500,22 +602,195 @@ mod tests {
                 recovery_scan_days: 180,
                 schedule_enabled: true,
                 schedule_interval_minutes: 60,
-                jira_sites: vec![JiraSiteUpdate {
-                    key: "acme".to_owned(),
-                    base_url: "https://acme.atlassian.net".to_owned(),
-                    email_env: "ACME_JIRA_EMAIL".to_owned(),
-                    api_token_env: "ACME_JIRA_API_TOKEN".to_owned(),
-                    email_value: None,
-                    api_token_value: None,
-                    enabled: true,
-                }],
+                jira_sites: vec![
+                    JiraSiteUpdate {
+                        key: "acme".to_owned(),
+                        base_url: "https://acme.atlassian.net".to_owned(),
+                        email_env: "ACME_JIRA_EMAIL".to_owned(),
+                        api_token_env: "ACME_JIRA_API_TOKEN".to_owned(),
+                        email_value: None,
+                        api_token_value: None,
+                        enabled: true,
+                    },
+                    JiraSiteUpdate {
+                        key: "client".to_owned(),
+                        base_url: "https://client.atlassian.net".to_owned(),
+                        email_env: "CLIENT_JIRA_EMAIL".to_owned(),
+                        api_token_env: "CLIENT_JIRA_API_TOKEN".to_owned(),
+                        email_value: None,
+                        api_token_value: None,
+                        enabled: true,
+                    },
+                ],
             },
         )
         .expect("save config");
 
         assert_eq!(saved.path, config_path.display().to_string());
         assert_eq!(saved.jira_sites[0].key, "acme");
+        assert_eq!(saved.jira_sites[1].key, "client");
         AppConfig::from_path(config_path).expect("saved config parses");
+    }
+
+    #[test]
+    fn config_snapshot_uses_temp_home_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let credentials_path = dir.path().join("credentials.env");
+        fs::write(
+            &config_path,
+            r#"[toggl]
+workspace_id = 123
+api_token_env = "TOGGL_API_TOKEN"
+
+[runtime]
+sqlite_path = "ledger.sqlite"
+
+[[jira.sites]]
+key = "acme"
+base_url = "https://acme.atlassian.net"
+email_env = "ACME_JIRA_EMAIL"
+api_token_env = "ACME_JIRA_API_TOKEN"
+"#,
+        )
+        .expect("write config");
+        fs::write(
+            &credentials_path,
+            "TOGGL_API_TOKEN=toggl-secret\nACME_JIRA_EMAIL=dev@example.com\nACME_JIRA_API_TOKEN=jira-secret\n",
+        )
+        .expect("write credentials");
+
+        let snapshot = config_snapshot_with_credentials(
+            SharedPaths {
+                config: Some(config_path.clone()),
+                db: None,
+            },
+            Some(credentials_path.clone()),
+        )
+        .expect("config snapshot");
+
+        assert_eq!(snapshot.config.path, config_path.display().to_string());
+        assert!(snapshot.config.toggl_api_token_present);
+        assert_eq!(
+            snapshot.config.toggl_api_token_value.as_deref(),
+            Some("toggl-secret")
+        );
+        assert_eq!(
+            snapshot.config.jira_sites[0].email_value.as_deref(),
+            Some("dev@example.com")
+        );
+        assert_eq!(
+            snapshot.config.jira_sites[0].api_token_value.as_deref(),
+            Some("jira-secret")
+        );
+        assert!(credentials_path.exists());
+    }
+
+    #[test]
+    fn explicit_config_snapshot_does_not_read_default_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous_home = env::var_os("HOME");
+        let previous_token = env::var_os("TOGGL_API_TOKEN");
+        env::set_var("HOME", dir.path());
+        env::remove_var("TOGGL_API_TOKEN");
+        let default_credentials = dir.path().join(".config/toggl-jira-sync/credentials.env");
+        fs::create_dir_all(default_credentials.parent().expect("parent")).expect("mkdir");
+        fs::write(&default_credentials, "TOGGL_API_TOKEN=default-secret\n").expect("credentials");
+
+        let config_path = dir.path().join("explicit.toml");
+        fs::write(
+            &config_path,
+            r#"[toggl]
+workspace_id = 123
+api_token_env = "TOGGL_API_TOKEN"
+
+[[jira.sites]]
+key = "acme"
+base_url = "https://acme.atlassian.net"
+email_env = "ACME_JIRA_EMAIL"
+api_token_env = "ACME_JIRA_API_TOKEN"
+"#,
+        )
+        .expect("config");
+
+        let snapshot = config_snapshot(SharedPaths {
+            config: Some(config_path),
+            db: None,
+        })
+        .expect("snapshot");
+
+        assert!(!snapshot.config.toggl_api_token_present);
+        assert_eq!(snapshot.config.toggl_api_token_value, None);
+
+        if let Some(home) = previous_home {
+            env::set_var("HOME", home);
+        } else {
+            env::remove_var("HOME");
+        }
+        if let Some(token) = previous_token {
+            env::set_var("TOGGL_API_TOKEN", token);
+        }
+    }
+
+    #[test]
+    fn snapshot_and_status_report_share_serializable_status_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let db_path = dir.path().join("ledger.sqlite");
+        write_sample_config(&config_path, db_path.to_str().expect("db path utf8"));
+
+        let database = Database::open(&db_path).expect("open db");
+        database.run_migrations().expect("migrations");
+        database
+            .upsert_toggl_entry(&NewTogglEntry {
+                toggl_workspace_id: "123",
+                toggl_entry_id: "456",
+                description: Some("ACME-456 implementation"),
+                extracted_issue_key: Some("ACME-456"),
+                source_hash: "sha256:status",
+                rounded_duration_seconds: 1800,
+                status: "created",
+                started_at: Some("2026-05-02T03:06:40Z"),
+                stopped_at: Some("2026-05-02T03:36:40Z"),
+            })
+            .expect("insert toggl entry");
+        database
+            .upsert_jira_worklog_link(&NewJiraWorklogLink {
+                toggl_workspace_id: "123",
+                toggl_entry_id: "456",
+                jira_site_key: "acme",
+                jira_issue_key: "ACME-456",
+                jira_worklog_id: Some("10001"),
+                source_hash: "sha256:status",
+                rounded_duration_seconds: 1800,
+                status: "created",
+            })
+            .expect("insert worklog link");
+
+        let app_snapshot = snapshot(
+            SharedPaths {
+                config: Some(config_path.clone()),
+                db: Some(db_path.clone()),
+            },
+            10,
+        )
+        .expect("app snapshot");
+        let (_, _, report) = status_report(
+            SharedPaths {
+                config: Some(config_path),
+                db: Some(db_path),
+            },
+            10,
+        )
+        .expect("status report");
+
+        assert_eq!(app_snapshot.status, report);
+        assert_eq!(app_snapshot.status.summary.synced_count, 1);
+        assert_eq!(
+            app_snapshot.status.entries[0].issue_key.as_deref(),
+            Some("ACME-456")
+        );
+        serde_json::to_value(&app_snapshot).expect("snapshot serializes");
     }
 
     #[test]
