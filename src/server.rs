@@ -253,12 +253,19 @@ async fn run_sync_off_thread(
             .enable_all()
             .build()
             .context("failed to start sync runtime")?
-            .block_on(app::run_sync_with_credentials(
-                paths,
-                dry_run,
-                cleanup_deleted,
-                credentials_path,
-            ))
+            .block_on(async move {
+                if let Some(credentials_path) = credentials_path {
+                    app::run_sync_with_isolated_credentials(
+                        paths,
+                        dry_run,
+                        cleanup_deleted,
+                        credentials_path,
+                    )
+                    .await
+                } else {
+                    app::run_sync_with_credentials(paths, dry_run, cleanup_deleted, None).await
+                }
+            })
     })
     .await
     .context("sync task failed")?

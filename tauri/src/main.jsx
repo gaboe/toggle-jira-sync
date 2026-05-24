@@ -12,6 +12,7 @@ const apiBaseUrl = (desktopApiBaseUrl || webApiBaseUrl).replace(/\/$/, "");
 const tenantId = import.meta.env.VITE_TJS_TENANT_ID || "";
 const tenantToken = import.meta.env.VITE_TJS_TENANT_TOKEN || "";
 const tenantApiPrefix = tenantId ? `/api/tenants/${encodeURIComponent(tenantId)}` : "/api";
+const isTenantMode = Boolean(tenantId);
 
 async function apiRequest(path, options = {}) {
   if (!apiBaseUrl) {
@@ -186,7 +187,7 @@ function App() {
 
   createEffect(() => {
     clearTimeout(backgroundTimer);
-    if (!schedule().enabled || !guiBackgroundSyncEnabled()) {
+    if (isTenantMode || !schedule().enabled || !guiBackgroundSyncEnabled()) {
       setNextBackgroundSyncAt(null);
       return;
     }
@@ -362,7 +363,7 @@ function App() {
           <Match when={view() === "configuration"}>
             <section class="view-surface">
               <Show when={config()} fallback={<div class="panel empty-detail">{loadError() || "Loading configuration…"}</div>}>
-                <Configuration config={config()} guiBackgroundSyncEnabled={guiBackgroundSyncEnabled()} saveConfig={saveConfig} deleteLocalData={deleteLocalData} exportConfig={exportConfig} />
+                <Configuration config={config()} guiBackgroundSyncEnabled={guiBackgroundSyncEnabled()} saveConfig={saveConfig} deleteLocalData={deleteLocalData} exportConfig={exportConfig} readOnly={isTenantMode} />
               </Show>
             </section>
           </Match>
@@ -386,7 +387,7 @@ function AppShell(props) {
           <div class="nav-brand" aria-label="Toggl Jira Sync">
             <strong>TJS</strong>
           </div>
-          <NavTabs view={props.view} setView={props.setView} />
+      <NavTabs view={props.view} setView={props.setView} readOnlyConfig={isTenantMode} />
         </aside>
         <div class="shell-main">
           <TopBar title={title()} description={description()} actions={props.actions} />
@@ -421,7 +422,7 @@ function NavTabs(props) {
       </button>
       <button title="Configuration" aria-label="Configuration, paths, secrets, and schedule" classList={{ active: props.view === "configuration" }} onClick={() => props.setView("configuration")}>
         <span class="nav-mark">C</span>
-        <span class="nav-label">Configuration</span>
+        <span class="nav-label">{props.readOnlyConfig ? "Tenant config" : "Configuration"}</span>
       </button>
     </nav>
   );
@@ -597,6 +598,7 @@ function IssuePanel(props) {
 }
 
 function Configuration(props) {
+  const disabled = () => props.readOnly;
   const newSite = () => ({ key: "", base_url: "", email_env: "", email_value: "", email_present: false, api_token_env: "", api_token_value: "", api_token_present: false, enabled: true, local_id: crypto.randomUUID() });
   const withLocalIds = (sites) => (sites.length ? sites : [newSite()]).map((site) => ({ ...site, local_id: site.local_id || crypto.randomUUID() }));
   const [sites, setSites] = createSignal(withLocalIds(props.config.jira_sites || []));
@@ -607,28 +609,28 @@ function Configuration(props) {
   const removeSite = (localId) => setSites((current) => current.length === 1 ? current : current.filter((site) => site.local_id !== localId));
   return (
     <form class="panel config-grid" onSubmit={props.saveConfig}>
-      <div class="panel-head full"><div><h2>Configuration</h2><p>{props.config.path}</p></div><div class="config-actions"><button class="secondary" type="button" onClick={props.exportConfig}>Export configuration</button><button class="danger" type="button" onClick={props.deleteLocalData}>Delete local data</button><button class="primary" type="submit">Save configuration</button></div></div>
-      <label>Workspace ID <input name="toggl_workspace_id" type="number" value={props.config.toggl_workspace_id} required /></label>
+      <div class="panel-head full"><div><h2>{props.readOnly ? "Tenant configuration" : "Configuration"}</h2><p>{props.readOnly ? "Managed by the tenant administrator." : props.config.path}</p></div><Show when={!props.readOnly}><div class="config-actions"><button class="secondary" type="button" onClick={props.exportConfig}>Export configuration</button><button class="danger" type="button" onClick={props.deleteLocalData}>Delete local data</button><button class="primary" type="submit">Save configuration</button></div></Show></div>
+      <label>Workspace ID <input name="toggl_workspace_id" type="number" value={props.config.toggl_workspace_id} required disabled={disabled()} /></label>
       <input type="hidden" name="toggl_api_token_env" value={props.config.toggl_api_token_env || "TOGGL_API_TOKEN"} />
-      <SecretField label="Toggl API token" name="toggl_api_token_value" value={props.config.toggl_api_token_value || ""} visible={showTogglToken()} setVisible={setShowTogglToken} placeholder={props.config.toggl_api_token_present ? "Token saved; leave blank to keep it" : "Paste Toggl API token"} />
-      <label>SQLite path <input name="sqlite_path" value={props.config.sqlite_path} required /></label>
-      <label>Initial sync from month <input name="initial_backfill_from_month" type="month" value={configMonthToInput(props.config.initial_backfill_from_month)} /></label>
-      <label>Recovery scan from month <input name="recovery_from_month" type="month" value={configMonthToInput(props.config.recovery_from_month)} /></label>
-      <details class="advanced-config full"><summary>Advanced day-count fallback</summary><div class="advanced-grid"><label>Initial backfill days <input name="initial_backfill_days" type="number" min="1" value={props.config.initial_backfill_days} required /></label><label>Recovery scan days <input name="recovery_scan_days" type="number" min="1" value={props.config.recovery_scan_days} required /></label></div><p>Used only when the matching month field is empty. Month values use the first day of that month.</p></details>
-      <label>Schedule interval minutes <input name="schedule_interval_minutes" type="number" min="1" value={props.config.schedule_interval_minutes} required /></label>
-      <label class="check"><input name="schedule_enabled" type="checkbox" checked={props.config.schedule_enabled} /> Enable OS schedule</label>
-      <label class="check"><input name="gui_background_sync_enabled" type="checkbox" checked={props.guiBackgroundSyncEnabled} /> Sync hourly while this app is open</label>
+      <SecretField label="Toggl API token" name="toggl_api_token_value" value={props.config.toggl_api_token_value || ""} visible={showTogglToken()} setVisible={setShowTogglToken} placeholder={props.config.toggl_api_token_present ? "Token saved; leave blank to keep it" : "Paste Toggl API token"} disabled={disabled()} />
+      <label>SQLite path <input name="sqlite_path" value={props.config.sqlite_path} required disabled={disabled()} /></label>
+      <label>Initial sync from month <input name="initial_backfill_from_month" type="month" value={configMonthToInput(props.config.initial_backfill_from_month)} disabled={disabled()} /></label>
+      <label>Recovery scan from month <input name="recovery_from_month" type="month" value={configMonthToInput(props.config.recovery_from_month)} disabled={disabled()} /></label>
+      <details class="advanced-config full"><summary>Advanced day-count fallback</summary><div class="advanced-grid"><label>Initial backfill days <input name="initial_backfill_days" type="number" min="1" value={props.config.initial_backfill_days} required disabled={disabled()} /></label><label>Recovery scan days <input name="recovery_scan_days" type="number" min="1" value={props.config.recovery_scan_days} required disabled={disabled()} /></label></div><p>Used only when the matching month field is empty. Month values use the first day of that month.</p></details>
+      <label>Schedule interval minutes <input name="schedule_interval_minutes" type="number" min="1" value={props.config.schedule_interval_minutes} required disabled={disabled()} /></label>
+      <label class="check"><input name="schedule_enabled" type="checkbox" checked={props.config.schedule_enabled} disabled={disabled()} /> Enable OS schedule</label>
+      <Show when={!props.readOnly}><label class="check"><input name="gui_background_sync_enabled" type="checkbox" checked={props.guiBackgroundSyncEnabled} /> Sync hourly while this app is open</label></Show>
       <section class="sites-section full">
-        <div class="site-card-head"><div><h3>Jira sites</h3><span>{sites().length} configured</span></div><button type="button" class="secondary" onClick={addSite}>Add Jira site</button></div>
+        <div class="site-card-head"><div><h3>Jira sites</h3><span>{sites().length} configured</span></div><Show when={!props.readOnly}><button type="button" class="secondary" onClick={addSite}>Add Jira site</button></Show></div>
         <For each={sites()}>{(site, index) => (
           <section class="site-card" data-jira-site>
-            <div class="site-card-head"><div><h3>Jira site {index() + 1}</h3><span>{site.key || "New site"}</span></div><Show when={sites().length > 1}><button type="button" class="danger" onClick={() => removeSite(site.local_id)}>Remove</button></Show></div>
-            <label>Site key <input name="jira_key" value={site.key || ""} required /></label><label>Base URL <input name="jira_base_url" value={site.base_url || ""} required /></label>
+            <div class="site-card-head"><div><h3>Jira site {index() + 1}</h3><span>{site.key || "New site"}</span></div><Show when={!props.readOnly && sites().length > 1}><button type="button" class="danger" onClick={() => removeSite(site.local_id)}>Remove</button></Show></div>
+            <label>Site key <input name="jira_key" value={site.key || ""} required disabled={disabled()} /></label><label>Base URL <input name="jira_base_url" value={site.base_url || ""} required disabled={disabled()} /></label>
             <input type="hidden" name="jira_email_env" value={site.email_env || ""} />
-            <label>Jira email <input name="jira_email_value" type="email" value={site.email_value || ""} placeholder={site.email_present ? "Email saved; leave blank to keep it" : "name@example.com"} /></label>
+            <label>Jira email <input name="jira_email_value" type="email" value={site.email_value || ""} placeholder={site.email_present ? "Email saved; leave blank to keep it" : "name@example.com"} disabled={disabled()} /></label>
             <input type="hidden" name="jira_api_token_env" value={site.api_token_env || ""} />
-            <SecretField label="Jira API token" name="jira_api_token_value" value={site.api_token_value || ""} visible={showJiraToken()} setVisible={setShowJiraToken} placeholder={site.api_token_present ? "Token saved; leave blank to keep it" : "Paste Jira API token"} />
-            <label class="check"><input name="jira_enabled" type="checkbox" checked={site.enabled ?? true} /> Enabled</label>
+            <SecretField label="Jira API token" name="jira_api_token_value" value={site.api_token_value || ""} visible={showJiraToken()} setVisible={setShowJiraToken} placeholder={site.api_token_present ? "Token saved; leave blank to keep it" : "Paste Jira API token"} disabled={disabled()} />
+            <label class="check"><input name="jira_enabled" type="checkbox" checked={site.enabled ?? true} disabled={disabled()} /> Enabled</label>
           </section>
         )}</For>
       </section>
@@ -641,8 +643,8 @@ function SecretField(props) {
   return (
     <label>{props.label}
       <span class="secret-control">
-        <input name={props.name} type={type()} value={props.value} placeholder={props.placeholder} />
-        <button type="button" class="secret-toggle" aria-label={props.visible ? `Hide ${props.label}` : `Show ${props.label}`} title={props.visible ? "Hide" : "Show"} onClick={() => props.setVisible(!props.visible)}><EyeIcon hidden={props.visible} /></button>
+        <input name={props.name} type={type()} value={props.value} placeholder={props.placeholder} disabled={props.disabled} />
+        <button type="button" class="secret-toggle" aria-label={props.visible ? `Hide ${props.label}` : `Show ${props.label}`} title={props.visible ? "Hide" : "Show"} disabled={props.disabled} onClick={() => props.setVisible(!props.visible)}><EyeIcon hidden={props.visible} /></button>
       </span>
     </label>
   );

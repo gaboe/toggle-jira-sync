@@ -5,8 +5,8 @@ use anyhow::Context;
 use crate::{
     cli::SyncArgs,
     commands::config::{
-        load_credentials_from_path, load_default_credentials, resolve_config_path, resolve_db_path,
-        LocalCredentials,
+        load_credentials_from_path, load_default_credentials, load_isolated_credentials_from_path,
+        resolve_config_path, resolve_db_path, LocalCredentials,
     },
     config::{AppConfig, JiraSiteConfig},
     db::{Database, NewSyncRun, NewTogglEntry, StoredJiraWorklogLink},
@@ -39,6 +39,15 @@ pub async fn run_with_credentials(
     run_with_config(args, config_path, credentials).await
 }
 
+pub async fn run_with_isolated_credentials(
+    args: SyncArgs,
+    credentials_path: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    let config_path = resolve_config_path(args.paths.config.clone())?;
+    let credentials = Some(load_isolated_credentials_from_path(&credentials_path)?);
+    run_with_config(args, config_path, credentials).await
+}
+
 async fn run_with_config(
     args: SyncArgs,
     config_path: std::path::PathBuf,
@@ -52,7 +61,7 @@ async fn run_with_config(
     } else if uses_default_config {
         load_default_credentials()?
     } else {
-        LocalCredentials::default()
+        LocalCredentials::process_env()
     };
     let db_path = resolve_db_path(
         args.paths.db,

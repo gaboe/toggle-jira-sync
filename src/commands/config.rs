@@ -255,35 +255,62 @@ pub(crate) fn resolve_config_path(path: Option<PathBuf>) -> anyhow::Result<PathB
 #[derive(Debug, Default)]
 pub(crate) struct LocalCredentials {
     values: HashMap<String, String>,
+    allow_process_env: bool,
 }
 
 impl LocalCredentials {
+    pub(crate) fn process_env() -> Self {
+        Self {
+            values: HashMap::new(),
+            allow_process_env: true,
+        }
+    }
+
     pub(crate) fn get_secret(&self, name: &str) -> anyhow::Result<String> {
-        std::env::var(name)
-            .or_else(|_| {
-                self.values
-                    .get(name)
-                    .cloned()
-                    .ok_or(std::env::VarError::NotPresent)
+        self.values
+            .get(name)
+            .cloned()
+            .or_else(|| {
+                self.allow_process_env
+                    .then(|| std::env::var(name).ok())
+                    .flatten()
             })
+            .ok_or(std::env::VarError::NotPresent)
             .with_context(|| format!("missing env var {name}"))
     }
 
     pub(crate) fn contains_secret(&self, name: &str) -> bool {
-        std::env::var_os(name).is_some() || self.values.contains_key(name)
+        self.values.contains_key(name)
+            || (self.allow_process_env && std::env::var_os(name).is_some())
     }
 }
 
 pub(crate) fn load_default_credentials() -> anyhow::Result<LocalCredentials> {
     let credentials_path = resolve_credentials_path(None)?;
-    load_credentials_from_path(&credentials_path)
+    load_credentials_from_path_with_env(&credentials_path, true)
 }
 
 pub(crate) fn load_credentials_from_path(
     credentials_path: &Path,
 ) -> anyhow::Result<LocalCredentials> {
+    load_credentials_from_path_with_env(credentials_path, true)
+}
+
+pub(crate) fn load_isolated_credentials_from_path(
+    credentials_path: &Path,
+) -> anyhow::Result<LocalCredentials> {
+    load_credentials_from_path_with_env(credentials_path, false)
+}
+
+fn load_credentials_from_path_with_env(
+    credentials_path: &Path,
+    allow_process_env: bool,
+) -> anyhow::Result<LocalCredentials> {
     if !credentials_path.exists() {
-        return Ok(LocalCredentials::default());
+        return Ok(LocalCredentials {
+            values: HashMap::new(),
+            allow_process_env,
+        });
     }
 
     let values = read_credentials(credentials_path)
@@ -291,7 +318,10 @@ pub(crate) fn load_credentials_from_path(
         .into_iter()
         .collect();
 
-    Ok(LocalCredentials { values })
+    Ok(LocalCredentials {
+        values,
+        allow_process_env,
+    })
 }
 
 pub(crate) fn resolve_db_path(

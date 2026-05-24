@@ -124,13 +124,14 @@ pub fn snapshot_with_credentials(
     credentials_path: Option<PathBuf>,
 ) -> anyhow::Result<AppStateSnapshot> {
     let (config_path, config, status) = status_report(paths, limit)?;
-    let credentials = read_credentials_for_config(&config_path, credentials_path)?;
+    let credentials = read_credentials_for_config(&config_path, credentials_path.clone())?;
+    let allow_process_env = credentials_path.is_none() && config_path == resolve_config_path(None)?;
     Ok(AppStateSnapshot {
         schedule: ScheduleSnapshot {
             enabled: config.schedule.enabled,
             interval_minutes: config.schedule.interval_minutes,
         },
-        config: ConfigSnapshot::from_config(config_path, &config, &credentials),
+        config: ConfigSnapshot::from_config(config_path, &config, &credentials, allow_process_env),
         status,
     })
 }
@@ -146,13 +147,14 @@ pub fn config_snapshot_with_credentials(
     let config_path = resolve_config_path(paths.config)?;
     let config = AppConfig::from_path(&config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
-    let credentials = read_credentials_for_config(&config_path, credentials_path)?;
+    let credentials = read_credentials_for_config(&config_path, credentials_path.clone())?;
+    let allow_process_env = credentials_path.is_none() && config_path == resolve_config_path(None)?;
     Ok(ConfigOnlySnapshot {
         schedule: ScheduleSnapshot {
             enabled: config.schedule.enabled,
             interval_minutes: config.schedule.interval_minutes,
         },
-        config: ConfigSnapshot::from_config(config_path, &config, &credentials),
+        config: ConfigSnapshot::from_config(config_path, &config, &credentials, allow_process_env),
     })
 }
 
@@ -209,6 +211,25 @@ pub async fn run_sync_with_credentials(
     crate::commands::sync::run(SyncArgs { ..args }).await
 }
 
+pub async fn run_sync_with_isolated_credentials(
+    paths: SharedPaths,
+    dry_run: bool,
+    _cleanup_deleted: bool,
+    credentials_path: PathBuf,
+) -> anyhow::Result<()> {
+    crate::commands::sync::run_with_isolated_credentials(
+        SyncArgs {
+            paths,
+            dry_run,
+            cleanup_deleted: true,
+            json: false,
+            quiet: true,
+        },
+        credentials_path,
+    )
+    .await
+}
+
 pub fn update_schedule(paths: SharedPaths, enabled: bool) -> anyhow::Result<ScheduleSnapshot> {
     let config_path = resolve_config_path(paths.config)?;
     let config = AppConfig::from_path(&config_path)
@@ -245,11 +266,13 @@ pub fn save_config_with_credentials(
     }
     fs::write(&config_path, contents)
         .with_context(|| format!("failed to write config {}", config_path.display()))?;
+    let allow_process_env = credentials_path.is_none() && config_path == resolve_config_path(None)?;
     let credentials = save_credentials_update(&update, credentials_path)?;
     Ok(ConfigSnapshot::from_config(
         config_path,
         &config,
         &credentials,
+        allow_process_env,
     ))
 }
 
@@ -341,12 +364,17 @@ impl ConfigSnapshot {
         path: PathBuf,
         config: &AppConfig,
         credentials: &HashMap<String, String>,
+        allow_process_env: bool,
     ) -> Self {
         Self {
             path: path.display().to_string(),
             toggl_workspace_id: config.toggl.workspace_id,
             toggl_api_token_env: config.toggl.api_token_env.clone(),
-            toggl_api_token_present: credential_present(credentials, &config.toggl.api_token_env),
+            toggl_api_token_present: credential_present(
+                credentials,
+                &config.toggl.api_token_env,
+                allow_process_env,
+            ),
             toggl_api_token_value: credentials.get(&config.toggl.api_token_env).cloned(),
             sqlite_path: config
                 .runtime
@@ -368,9 +396,17 @@ impl ConfigSnapshot {
                     base_url: site.base_url.clone(),
                     email_env: site.email_env.clone(),
                     api_token_env: site.api_token_env.clone(),
-                    email_present: credential_present(credentials, &site.email_env),
+                    email_present: credential_present(
+                        credentials,
+                        &site.email_env,
+                        allow_process_env,
+                    ),
                     email_value: credentials.get(&site.email_env).cloned(),
-                    api_token_present: credential_present(credentials, &site.api_token_env),
+                    api_token_present: credential_present(
+                        credentials,
+                        &site.api_token_env,
+                        allow_process_env,
+                    ),
                     api_token_value: credentials.get(&site.api_token_env).cloned(),
                     enabled: site.enabled,
                 })
@@ -379,8 +415,12 @@ impl ConfigSnapshot {
     }
 }
 
-fn credential_present(credentials: &HashMap<String, String>, name: &str) -> bool {
-    env::var_os(name).is_some() || credentials.contains_key(name)
+fn credential_present(
+    credentials: &HashMap<String, String>,
+    name: &str,
+    allow_process_env: bool,
+) -> bool {
+    credentials.contains_key(name) || (allow_process_env && env::var_os(name).is_some())
 }
 
 fn save_credentials_update(

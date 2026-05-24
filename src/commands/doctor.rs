@@ -17,7 +17,7 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     let credentials = if uses_default_config {
         load_default_credentials()?
     } else {
-        LocalCredentials::default()
+        LocalCredentials::process_env()
     };
     let db_path = resolve_db_path(
         args.paths.db,
