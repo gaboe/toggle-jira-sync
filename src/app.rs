@@ -228,6 +228,14 @@ pub fn update_schedule(paths: SharedPaths, enabled: bool) -> anyhow::Result<Sche
 }
 
 pub fn save_config(paths: SharedPaths, update: ConfigUpdate) -> anyhow::Result<ConfigSnapshot> {
+    save_config_with_credentials(paths, update, None)
+}
+
+pub fn save_config_with_credentials(
+    paths: SharedPaths,
+    update: ConfigUpdate,
+    credentials_path: Option<PathBuf>,
+) -> anyhow::Result<ConfigSnapshot> {
     let config_path = resolve_config_path(paths.config)?;
     let contents = render_config_update(&update);
     let config = AppConfig::from_toml_str(&contents).context("updated config failed validation")?;
@@ -237,7 +245,7 @@ pub fn save_config(paths: SharedPaths, update: ConfigUpdate) -> anyhow::Result<C
     }
     fs::write(&config_path, contents)
         .with_context(|| format!("failed to write config {}", config_path.display()))?;
-    let credentials = save_credentials_update(&update)?;
+    let credentials = save_credentials_update(&update, credentials_path)?;
     Ok(ConfigSnapshot::from_config(
         config_path,
         &config,
@@ -375,8 +383,14 @@ fn credential_present(credentials: &HashMap<String, String>, name: &str) -> bool
     env::var_os(name).is_some() || credentials.contains_key(name)
 }
 
-fn save_credentials_update(update: &ConfigUpdate) -> anyhow::Result<HashMap<String, String>> {
-    let mut credentials = read_default_credentials().unwrap_or_default();
+fn save_credentials_update(
+    update: &ConfigUpdate,
+    credentials_path: Option<PathBuf>,
+) -> anyhow::Result<HashMap<String, String>> {
+    let mut credentials = match credentials_path.as_ref() {
+        Some(path) => read_credentials_from_path(path.clone()).unwrap_or_default(),
+        None => read_default_credentials().unwrap_or_default(),
+    };
     let mut changed = false;
     changed |= upsert_secret(
         &mut credentials,
@@ -396,7 +410,11 @@ fn save_credentials_update(update: &ConfigUpdate) -> anyhow::Result<HashMap<Stri
         );
     }
     if changed {
-        write_default_credentials(&credentials)?;
+        if let Some(path) = credentials_path {
+            write_credentials_to_path(&path, &credentials)?;
+        } else {
+            write_default_credentials(&credentials)?;
+        }
     }
     Ok(credentials)
 }
@@ -463,6 +481,13 @@ fn read_credentials_from_path(path: PathBuf) -> anyhow::Result<HashMap<String, S
 
 fn write_default_credentials(credentials: &HashMap<String, String>) -> anyhow::Result<()> {
     let path = default_credentials_path()?;
+    write_credentials_to_path(&path, credentials)
+}
+
+fn write_credentials_to_path(
+    path: &PathBuf,
+    credentials: &HashMap<String, String>,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -472,7 +497,7 @@ fn write_default_credentials(credentials: &HashMap<String, String>) -> anyhow::R
         .map(|(key, value)| format!("{key}={}", value.replace('\n', "")))
         .collect::<Vec<_>>();
     lines.sort();
-    fs::write(&path, format!("{}\n", lines.join("\n")))
+    fs::write(path, format!("{}\n", lines.join("\n")))
         .with_context(|| format!("failed to write credentials {}", path.display()))?;
     Ok(())
 }

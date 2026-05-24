@@ -148,7 +148,13 @@ fn cors_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
             origin.to_str().ok().is_some_and(|origin| {
-                origin.starts_with("http://127.0.0.1:") || origin.starts_with("http://localhost:")
+                origin.starts_with("http://127.0.0.1:")
+                    || origin.starts_with("http://localhost:")
+                    || std::env::var("TJS_ALLOWED_ORIGINS")
+                        .ok()
+                        .is_some_and(|origins| {
+                            origins.split(',').any(|allowed| allowed.trim() == origin)
+                        })
             })
         }))
         .allow_methods([
@@ -271,7 +277,7 @@ async fn save_config(
     State(state): State<Arc<ServerState>>,
     Json(update): Json<ConfigUpdate>,
 ) -> ApiResult<ConfigSnapshot> {
-    app::save_config(state.paths.clone(), update)
+    app::save_config_with_credentials(state.paths.clone(), update, state.credentials_path.clone())
         .map(|mut snapshot| {
             snapshot.redact_secrets();
             Json(snapshot)
@@ -792,6 +798,13 @@ api_token_env = "ACME_JIRA_API_TOKEN"
         assert_cors_origin("http://localhost:5174").await;
     }
 
+    #[tokio::test]
+    async fn cors_allows_configured_saas_origin() {
+        std::env::set_var("TJS_ALLOWED_ORIGINS", "https://tjs.example.com");
+        assert_cors_origin("https://tjs.example.com").await;
+        std::env::remove_var("TJS_ALLOWED_ORIGINS");
+    }
+
     async fn assert_cors_origin(origin: &'static str) {
         let response = single_router()
             .oneshot(
@@ -810,6 +823,74 @@ api_token_env = "ACME_JIRA_API_TOKEN"
         assert_eq!(
             response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
             Some(&HeaderValue::from_static(origin))
+        );
+    }
+
+    #[tokio::test]
+    async fn save_config_uses_explicit_credentials_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let credentials_path = dir.path().join("credentials.env");
+        let db_path = dir.path().join("sync.sqlite");
+        write_test_config(&config_path, &db_path, "https://api.track.toggl.com");
+
+        let update = serde_json::json!({
+            "toggl_workspace_id": 123,
+            "toggl_api_token_env": "TOGGL_API_TOKEN",
+            "toggl_api_token_value": "saved-token",
+            "sqlite_path": db_path.display().to_string(),
+            "initial_backfill_from_month": null,
+            "initial_backfill_days": 90,
+            "recovery_from_month": null,
+            "recovery_scan_days": 180,
+            "schedule_enabled": true,
+            "schedule_interval_minutes": 60,
+            "jira_sites": [{
+                "key": "acme",
+                "base_url": "https://acme.atlassian.net",
+                "email_env": "ACME_JIRA_EMAIL",
+                "email_value": "dev@example.com",
+                "api_token_env": "ACME_JIRA_API_TOKEN",
+                "api_token_value": "jira-token",
+                "enabled": true
+            }]
+        });
+
+        let response = router(
+            SharedPaths {
+                config: Some(config_path),
+                db: Some(db_path),
+            },
+            Some(credentials_path.clone()),
+            200,
+            ServerMode::Single,
+            None,
+        )
+        .expect("router")
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/config")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(update.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let credentials = std::fs::read_to_string(credentials_path).expect("credentials");
+        assert!(
+            credentials.contains("TOGGL_API_TOKEN=saved-token"),
+            "{credentials}"
+        );
+        assert!(
+            credentials.contains("ACME_JIRA_EMAIL=dev@example.com"),
+            "{credentials}"
+        );
+        assert!(
+            credentials.contains("ACME_JIRA_API_TOKEN=jira-token"),
+            "{credentials}"
         );
     }
 

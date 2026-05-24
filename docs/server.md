@@ -37,6 +37,31 @@ POST /api/tenants/{tenant_id}/sync
 
 A token for tenant `a` cannot access tenant `b`; mismatches return `403`. Missing or invalid tokens return `401`.
 
+For a web client pointed at multi mode, provide the API base URL, tenant id, and token to the frontend build/runtime:
+
+```sh
+VITE_TJS_API_BASE_URL=https://tjs.example.com \
+VITE_TJS_TENANT_ID=tenant-a \
+VITE_TJS_TENANT_TOKEN=replace-with-tenant-token \
+bun run build
+```
+
+For hosted web origins, allow the exact origin with `TJS_ALLOWED_ORIGINS`:
+
+```sh
+TJS_ALLOWED_ORIGINS=https://tjs.example.com toggl-jira-sync server --mode multi --tenant-db ./tenants.sqlite
+```
+
+Seed tenants by inserting one row in `server_tenants` and one hashed token row in `tenant_api_tokens`. The token hash format is `sha256:<lowercase-hex-sha256-token>`:
+
+```sql
+INSERT INTO server_tenants (tenant_id, slug, display_name, config_path, credentials_path, db_path)
+VALUES ('tenant-a', 'tenant-a', 'Tenant A', '/data/tenant-a/config.toml', '/data/tenant-a/credentials.env', '/data/tenant-a/sync.sqlite');
+
+INSERT INTO tenant_api_tokens (tenant_id, token_hash, token_label)
+VALUES ('tenant-a', 'sha256:REPLACE_WITH_SHA256_HEX', 'web client');
+```
+
 Multi mode intentionally does not include public signup, billing, OAuth, organization management, an admin portal, cross-tenant reporting, tenant config editing, local data deletion, or config export. Add those only after the secret-storage and audit model is designed.
 
 ## Deployment guardrails

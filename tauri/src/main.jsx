@@ -9,6 +9,9 @@ const minimumBusyMs = 650;
 const desktopApiBaseUrl = window.__TJS_API_BASE_URL__ || "";
 const webApiBaseUrl = import.meta.env.VITE_TJS_API_BASE_URL || "";
 const apiBaseUrl = (desktopApiBaseUrl || webApiBaseUrl).replace(/\/$/, "");
+const tenantId = import.meta.env.VITE_TJS_TENANT_ID || "";
+const tenantToken = import.meta.env.VITE_TJS_TENANT_TOKEN || "";
+const tenantApiPrefix = tenantId ? `/api/tenants/${encodeURIComponent(tenantId)}` : "/api";
 
 async function apiRequest(path, options = {}) {
   if (!apiBaseUrl) {
@@ -16,7 +19,10 @@ async function apiRequest(path, options = {}) {
   }
   const response = await fetch(`${apiBaseUrl}${path}`, {
     method: options.method || "GET",
-    headers: options.body ? { "Content-Type": "application/json" } : undefined,
+    headers: {
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(tenantToken ? { Authorization: `Bearer ${tenantToken}` } : {}),
+    },
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
   const payload = await response.json().catch(() => null);
@@ -25,10 +31,10 @@ async function apiRequest(path, options = {}) {
 }
 
 const api = {
-  snapshot: () => apiRequest("/api/snapshot", { tauriCommand: "snapshot" }),
-  configSnapshot: () => apiRequest("/api/config", { tauriCommand: "config_snapshot" }),
-  dryRun: () => apiRequest("/api/sync/dry-run", { method: "POST", tauriCommand: "dry_run" }),
-  sync: () => apiRequest("/api/sync", { method: "POST", tauriCommand: "sync" }),
+  snapshot: () => apiRequest(`${tenantApiPrefix}/snapshot`, { tauriCommand: "snapshot" }),
+  configSnapshot: () => apiRequest(`${tenantApiPrefix}/config`, { tauriCommand: "config_snapshot" }),
+  dryRun: () => apiRequest(`${tenantApiPrefix}/sync/dry-run`, { method: "POST", tauriCommand: "dry_run" }),
+  sync: () => apiRequest(`${tenantApiPrefix}/sync`, { method: "POST", tauriCommand: "sync" }),
   saveConfig: (update) => apiRequest("/api/config", { method: "PUT", body: update, tauriCommand: "save_config", tauriArgs: { update } }),
   deleteLocalData: () => apiRequest("/api/local-data", { method: "DELETE", tauriCommand: "delete_local_data" }),
   exportConfig: () => apiRequest("/api/config/export", { method: "POST", tauriCommand: "export_config" }),
