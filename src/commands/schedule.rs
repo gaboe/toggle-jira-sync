@@ -7,8 +7,8 @@ use anyhow::{anyhow, bail, Context};
 
 use crate::{
     cli::{ScheduleArgs, ScheduleCommand},
-    commands::config::resolve_config_path,
     config::AppConfig,
+    local_api::LocalServer,
 };
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -16,55 +16,46 @@ const JOB_NAME: &str = "toggl-jira-sync";
 #[cfg(target_os = "macos")]
 const MACOS_LABEL: &str = "com.toggl-jira-sync.hourly";
 
-pub fn run(args: ScheduleArgs) -> anyhow::Result<()> {
-    let config_path = resolve_config_path(args.paths.config)?;
+pub async fn run(args: ScheduleArgs) -> anyhow::Result<()> {
+    let server = LocalServer::start(args.paths, None, 200).await?;
+    let client = server.client();
     match args.command {
         ScheduleCommand::Install => {
-            let config = AppConfig::from_path(&config_path)
-                .with_context(|| format!("failed to load config {}", config_path.display()))?;
-            install_default_job(&config_path, config.schedule.interval_minutes)?;
+            let schedule = client.install_schedule().await?;
             println!(
                 "schedule installed: every {} minutes",
-                config.schedule.interval_minutes
+                schedule.interval_minutes
             );
         }
         ScheduleCommand::Uninstall => {
-            uninstall_job()?;
+            client.uninstall_schedule().await?;
             println!("schedule uninstalled");
         }
         ScheduleCommand::Status => {
-            let config = AppConfig::from_path(&config_path)
-                .with_context(|| format!("failed to load config {}", config_path.display()))?;
-            println!("schedule enabled: {}", config.schedule.enabled);
-            println!("interval minutes: {}", config.schedule.interval_minutes);
-            println!("job path: {}", job_path()?.display());
-            println!("job installed: {}", job_path()?.exists());
+            let status = client.schedule_status().await?;
+            println!("schedule enabled: {}", status.enabled);
+            println!("interval minutes: {}", status.interval_minutes);
+            println!("job path: {}", status.job_path);
+            println!("job installed: {}", status.job_installed);
         }
         ScheduleCommand::Set(set) => {
             if set.enabled && set.disabled {
                 bail!("use either --enabled or --disabled, not both");
             }
-            update_schedule_config(
-                &config_path,
-                set.interval_minutes,
-                if set.enabled {
-                    Some(true)
-                } else if set.disabled {
-                    Some(false)
-                } else {
-                    None
-                },
-            )?;
-            let config = AppConfig::from_path(&config_path)
-                .with_context(|| format!("failed to reload config {}", config_path.display()))?;
-            if config.schedule.enabled {
-                install_default_job(&config_path, config.schedule.interval_minutes)?;
+            let enabled = if set.enabled {
+                Some(true)
+            } else if set.disabled {
+                Some(false)
+            } else {
+                None
+            };
+            let schedule = client.set_schedule(set.interval_minutes, enabled).await?;
+            if schedule.enabled {
                 println!(
                     "schedule enabled: every {} minutes",
-                    config.schedule.interval_minutes
+                    schedule.interval_minutes
                 );
             } else {
-                uninstall_job()?;
                 println!("schedule disabled");
             }
         }
@@ -271,17 +262,17 @@ fn render_job_file(executable: &Path, config_path: &Path, interval_minutes: u32)
 }
 
 #[cfg(target_os = "macos")]
-fn job_path() -> anyhow::Result<PathBuf> {
+pub(crate) fn job_path() -> anyhow::Result<PathBuf> {
     Ok(home_dir()?.join(format!("Library/LaunchAgents/{MACOS_LABEL}.plist")))
 }
 
 #[cfg(target_os = "linux")]
-fn job_path() -> anyhow::Result<PathBuf> {
+pub(crate) fn job_path() -> anyhow::Result<PathBuf> {
     Ok(home_dir()?.join(format!(".config/systemd/user/{JOB_NAME}.timer")))
 }
 
 #[cfg(target_os = "windows")]
-fn job_path() -> anyhow::Result<PathBuf> {
+pub(crate) fn job_path() -> anyhow::Result<PathBuf> {
     let appdata = env::var_os("APPDATA").ok_or_else(|| anyhow!("APPDATA must be set"))?;
     Ok(PathBuf::from(appdata).join(format!("{JOB_NAME}.schedule.cmd")))
 }

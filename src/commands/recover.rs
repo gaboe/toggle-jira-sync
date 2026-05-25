@@ -1,16 +1,21 @@
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::RecoverArgs,
     commands::config::{
-        load_default_credentials, resolve_config_path, resolve_db_path, LocalCredentials,
+        load_default_credentials, load_isolated_credentials_from_path, resolve_config_path,
+        resolve_db_path, LocalCredentials,
     },
     config::AppConfig,
     db::{Database, NewSyncRun},
     jira::JiraClient,
+    local_api::LocalServer,
     sync::{
         planner::{extract_issue_keys, IssueSiteMapping},
-        recovery::{recover, RecoveryInput, RecoveryReport, RecoverySite},
+        recovery::{
+            recover, RecoveryConflict, RecoveryInput, RecoveryReport, RecoverySite, RecoveryWarning,
+        },
         resolver::{IssueSiteResolutionError, IssueSiteResolver, ResolverSite},
     },
     toggl::{TogglClient, TogglClientConfig, TogglTimeEntry},
@@ -18,12 +23,60 @@ use crate::{
 
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryCommandReport {
+    pub mode: String,
+    pub scanned_entries: usize,
+    pub scanned_issues: usize,
+    pub scanned_worklogs: usize,
+    pub recovered_links: usize,
+    pub conflicts: Vec<RecoveryConflict>,
+    pub warnings: Vec<RecoveryWarning>,
+}
+
+impl From<RecoveryReport> for RecoveryCommandReport {
+    fn from(report: RecoveryReport) -> Self {
+        Self {
+            mode: report.mode.to_owned(),
+            scanned_entries: report.scanned_entries,
+            scanned_issues: report.scanned_issues,
+            scanned_worklogs: report.scanned_worklogs,
+            recovered_links: report.recovered_links,
+            conflicts: report.conflicts,
+            warnings: report.warnings,
+        }
+    }
+}
+
+impl RecoveryCommandReport {
+    pub fn print(&self, json: bool) -> anyhow::Result<()> {
+        if json {
+            println!("{}", serde_json::to_string_pretty(self)?);
+        } else {
+            println!("{}", human_report(self));
+        }
+        Ok(())
+    }
+}
+
 pub async fn run(args: RecoverArgs) -> anyhow::Result<()> {
+    let json = args.json;
+    let server = LocalServer::start(args.paths.clone(), None, 200).await?;
+    let report = server.client().recover_command().await?;
+    report.print(json)
+}
+
+pub(crate) async fn recover_report(
+    args: RecoverArgs,
+    credentials: Option<LocalCredentials>,
+) -> anyhow::Result<RecoveryCommandReport> {
     let uses_default_config = args.paths.config.is_none();
     let config_path = resolve_config_path(args.paths.config)?;
     let config = AppConfig::from_path(&config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
-    let credentials = if uses_default_config {
+    let credentials = if let Some(credentials) = credentials {
+        credentials
+    } else if uses_default_config {
         load_default_credentials()?
     } else {
         LocalCredentials::default()
@@ -84,13 +137,18 @@ pub async fn run(args: RecoverArgs) -> anyhow::Result<()> {
 
     lock.release().context("failed to release sync lock")?;
 
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!("{}", human_report(&report));
-    }
+    Ok(report.into())
+}
 
-    Ok(())
+pub(crate) async fn recover_report_with_isolated_credentials(
+    args: RecoverArgs,
+    credentials_path: std::path::PathBuf,
+) -> anyhow::Result<RecoveryCommandReport> {
+    recover_report(
+        args,
+        Some(load_isolated_credentials_from_path(&credentials_path)?),
+    )
+    .await
 }
 
 async fn resolve_issue_site_mappings(
@@ -168,7 +226,7 @@ fn recovery_since(
     now_unix_seconds - i64::from(recovery_scan_days) * SECONDS_PER_DAY
 }
 
-fn human_report(report: &RecoveryReport) -> String {
+fn human_report(report: &RecoveryCommandReport) -> String {
     format!(
         "Recovery scanned {} Toggl entries across {} Jira issues and {} worklogs; recovered {} links; conflicts: {}; warnings: {}",
         report.scanned_entries,

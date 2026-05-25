@@ -5,16 +5,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
 use anyhow::{anyhow, bail, Context};
+use serde::{Deserialize, Serialize};
 
 use crate::{
+    app::{ConfigUpdate, JiraSiteUpdate},
     cli::{ConfigArgs, ConfigCommand, ConfigSetupArgs, ConfigShowArgs, ConfigValidateArgs},
     commands::schedule,
     config::{AppConfig, ConfigError},
-    toggl::{TogglClient, TogglWorkspace},
+    local_api::LocalServer,
+    toggl::TogglWorkspace,
 };
 
 const TOGGL_API_TOKEN_ENV: &str = "TOGGL_API_TOKEN";
@@ -29,95 +29,185 @@ const DEFAULT_SQLITE_PATH: &str = "toggl-jira-sync.sqlite";
 pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
     match args.command {
         ConfigCommand::Setup(setup) => setup_config(setup).await,
-        ConfigCommand::Show(show) => show_config(show),
-        ConfigCommand::Validate(validate) => validate_config(validate),
+        ConfigCommand::Show(show) => show_config(show).await,
+        ConfigCommand::Validate(validate) => validate_config(validate).await,
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigShowReport {
+    pub lines: Vec<String>,
+}
+
+impl ConfigShowReport {
+    pub fn print(&self) {
+        for line in &self.lines {
+            println!("{line}");
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigValidateReport {
+    pub enabled_site_count: usize,
+}
+
+impl ConfigValidateReport {
+    pub fn print(&self) {
+        println!(
+            "config valid: {} Jira sites enabled",
+            self.enabled_site_count
+        );
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSetupWriteRequest {
+    pub update: ConfigUpdate,
+    pub install_schedule: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSetupWriteReport {
+    pub config_path: String,
+    pub credentials_path: String,
+    pub schedule_installed: bool,
+    pub schedule_interval_minutes: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ConfigDiscoverTogglWorkspacesRequest {
+    pub base_url: String,
+    pub api_token: String,
+}
+
+impl std::fmt::Debug for ConfigDiscoverTogglWorkspacesRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfigDiscoverTogglWorkspacesRequest")
+            .field("base_url", &self.base_url)
+            .field("api_token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigDiscoverTogglWorkspacesReport {
+    pub workspaces: Vec<TogglWorkspace>,
 }
 
 async fn setup_config(args: ConfigSetupArgs) -> anyhow::Result<()> {
     let config_path = resolve_config_path(args.config)?;
     let credentials_path = resolve_credentials_path(args.credentials)?;
 
-    let mut input = SetupInput::prompt().await?;
+    let server = LocalServer::start(
+        crate::cli::SharedPaths {
+            config: Some(config_path.clone()),
+            db: None,
+        },
+        Some(credentials_path.clone()),
+        200,
+    )
+    .await?;
+    let client = server.client();
+
+    let mut input = SetupInput::prompt(&client).await?;
     for site in &mut input.jira_sites {
         let site_env_prefix = env_prefix_for_site_key(&site.site_key)?;
         site.jira_email_env = format!("{site_env_prefix}_JIRA_EMAIL");
         site.jira_api_token_env = format!("{site_env_prefix}_JIRA_API_TOKEN");
     }
 
-    let config_text = render_config(&input);
-    AppConfig::from_toml_str(&config_text).context("generated config failed validation")?;
+    let request = ConfigSetupWriteRequest {
+        update: input.to_config_update(),
+        install_schedule: env::var_os("TJS_SKIP_SCHEDULE_INSTALL").is_none(),
+    };
+    let report = client.config_setup_write(&request).await?;
 
-    write_file(&config_path, &config_text)
-        .with_context(|| format!("failed to write config file {}", config_path.display()))?;
-
-    let credentials_text = render_credentials(&input);
-    write_secret_file(&credentials_path, &credentials_text).with_context(|| {
-        format!(
-            "failed to write credentials file {}",
-            credentials_path.display()
-        )
-    })?;
-
-    println!("config saved: {}", config_path.display());
-    println!("credentials saved: {}", credentials_path.display());
-    if env::var_os("TJS_SKIP_SCHEDULE_INSTALL").is_none() {
-        schedule::install_default_job(&config_path, input.schedule_interval_minutes)
-            .context("failed to install hourly sync OS job")?;
+    println!("config saved: {}", report.config_path);
+    println!("credentials saved: {}", report.credentials_path);
+    if report.schedule_installed {
         println!(
             "schedule installed: every {} minutes",
-            input.schedule_interval_minutes
+            report.schedule_interval_minutes
         );
     }
 
     Ok(())
 }
 
-fn show_config(args: ConfigShowArgs) -> anyhow::Result<()> {
-    let uses_default_config_path = args.config.is_none();
-    let config_path = resolve_config_path(args.config)?;
+async fn show_config(args: ConfigShowArgs) -> anyhow::Result<()> {
+    let server = LocalServer::start(
+        crate::cli::SharedPaths {
+            config: args.config,
+            db: None,
+        },
+        args.credentials,
+        200,
+    )
+    .await?;
+    let report = server.client().config_show(args.show_secrets).await?;
+    report.print();
+
+    Ok(())
+}
+
+pub(crate) fn config_show_report(
+    paths: crate::cli::SharedPaths,
+    credentials_path: Option<PathBuf>,
+    show_secrets: bool,
+) -> anyhow::Result<ConfigShowReport> {
+    let uses_default_config_path = paths.config.is_none();
+    let config_path = resolve_config_path(paths.config)?;
     let config = load_config_for_show(&config_path, uses_default_config_path)?;
-    let credentials_path = resolve_credentials_path(args.credentials)?;
+    let credentials_path = resolve_credentials_path(credentials_path)?;
     let credentials = read_credentials(&credentials_path)
         .with_context(|| format!("failed to read credentials {}", credentials_path.display()))?;
 
-    println!("config: {}", config_path.display());
-    println!("toggl:");
-    println!("  workspace_id: {}", config.toggl.workspace_id);
-    print_credential_line(
+    let mut lines = Vec::new();
+    lines.push(format!("config: {}", config_path.display()));
+    lines.push("toggl:".to_owned());
+    lines.push(format!("  workspace_id: {}", config.toggl.workspace_id));
+    push_credential_line(
+        &mut lines,
         "  ",
         &config.toggl.api_token_env,
         credentials.get(&config.toggl.api_token_env),
-        args.show_secrets,
+        show_secrets,
     );
-    println!("runtime:");
-    println!(
+    lines.push("runtime:".to_owned());
+    lines.push(format!(
         "  sqlite_path: {}",
         config.runtime.sqlite_path.as_deref().unwrap_or("<default>")
-    );
-    println!("schedule:");
-    println!("  enabled: {}", config.schedule.enabled);
-    println!("  interval_minutes: {}", config.schedule.interval_minutes);
-    println!("jira:");
+    ));
+    lines.push("schedule:".to_owned());
+    lines.push(format!("  enabled: {}", config.schedule.enabled));
+    lines.push(format!(
+        "  interval_minutes: {}",
+        config.schedule.interval_minutes
+    ));
+    lines.push("jira:".to_owned());
     for site in &config.jira.sites {
-        println!("  site: {}", site.key);
-        println!("    enabled: {}", site.enabled);
-        println!("    base_url: {}", site.base_url);
-        print_credential_line(
+        lines.push(format!("  site: {}", site.key));
+        lines.push(format!("    enabled: {}", site.enabled));
+        lines.push(format!("    base_url: {}", site.base_url));
+        push_credential_line(
+            &mut lines,
             "    ",
             &site.email_env,
             credentials.get(&site.email_env),
-            args.show_secrets,
+            show_secrets,
         );
-        print_credential_line(
+        push_credential_line(
+            &mut lines,
             "    ",
             &site.api_token_env,
             credentials.get(&site.api_token_env),
-            args.show_secrets,
+            show_secrets,
         );
     }
 
-    Ok(())
+    Ok(ConfigShowReport { lines })
 }
 
 fn load_config_for_show(
@@ -140,8 +230,26 @@ fn load_config_for_show(
     })
 }
 
-fn validate_config(args: ConfigValidateArgs) -> anyhow::Result<()> {
-    let config_path = args
+async fn validate_config(args: ConfigValidateArgs) -> anyhow::Result<()> {
+    let server = LocalServer::start(
+        crate::cli::SharedPaths {
+            config: args.config,
+            db: None,
+        },
+        None,
+        200,
+    )
+    .await?;
+    let report = server.client().config_validate().await?;
+    report.print();
+
+    Ok(())
+}
+
+pub(crate) fn config_validate_report(
+    paths: crate::cli::SharedPaths,
+) -> anyhow::Result<ConfigValidateReport> {
+    let config_path = paths
         .config
         .ok_or_else(|| anyhow!("--config is required for config validate"))?;
     let config = AppConfig::from_path(&config_path).map_err(|error| match error {
@@ -159,9 +267,30 @@ fn validate_config(args: ConfigValidateArgs) -> anyhow::Result<()> {
     })?;
     let enabled_site_count = config.enabled_jira_sites().len();
 
-    println!("config valid: {enabled_site_count} Jira sites enabled");
+    Ok(ConfigValidateReport { enabled_site_count })
+}
 
-    Ok(())
+pub(crate) fn config_setup_write(
+    paths: crate::cli::SharedPaths,
+    credentials_path: Option<PathBuf>,
+    request: ConfigSetupWriteRequest,
+) -> anyhow::Result<ConfigSetupWriteReport> {
+    let config_path = resolve_config_path(paths.config.clone())?;
+    let credentials_path = resolve_credentials_path(credentials_path)?;
+    let install_schedule = request.install_schedule;
+    let schedule_interval_minutes = request.update.schedule_interval_minutes;
+    crate::app::save_config_with_credentials(paths, request.update, Some(credentials_path.clone()))
+        .context("failed to save setup config")?;
+    if install_schedule {
+        schedule::install_default_job(&config_path, schedule_interval_minutes)
+            .context("failed to install hourly sync OS job")?;
+    }
+    Ok(ConfigSetupWriteReport {
+        config_path: config_path.display().to_string(),
+        credentials_path: credentials_path.display().to_string(),
+        schedule_installed: install_schedule,
+        schedule_interval_minutes,
+    })
 }
 
 #[derive(Debug)]
@@ -184,13 +313,15 @@ struct SetupJiraSiteInput {
 }
 
 impl SetupInput {
-    async fn prompt() -> anyhow::Result<Self> {
+    async fn prompt(client: &crate::local_api::LocalApiClient) -> anyhow::Result<Self> {
         let toggl_api_token = read_required("Toggl API token")?;
         let stdin_is_interactive = io::stdin().is_terminal();
         let discovered_workspaces = if stdin_is_interactive {
             Some(
-                TogglClient::list_workspaces(TOGGL_DEFAULT_BASE_URL, &toggl_api_token)
+                client
+                    .config_discover_toggl_workspaces(TOGGL_DEFAULT_BASE_URL, &toggl_api_token)
                     .await
+                    .map(|report| report.workspaces)
                     .map_err(|error| error.to_string()),
             )
         } else {
@@ -244,6 +375,34 @@ impl SetupInput {
             sqlite_path,
             schedule_interval_minutes,
         })
+    }
+
+    fn to_config_update(&self) -> ConfigUpdate {
+        ConfigUpdate {
+            toggl_workspace_id: self.toggl_workspace_id,
+            toggl_api_token_env: TOGGL_API_TOKEN_ENV.to_owned(),
+            toggl_api_token_value: Some(self.toggl_api_token.clone()),
+            sqlite_path: self.sqlite_path.clone(),
+            initial_backfill_from_month: None,
+            initial_backfill_days: 90,
+            recovery_from_month: None,
+            recovery_scan_days: 180,
+            schedule_enabled: true,
+            schedule_interval_minutes: self.schedule_interval_minutes,
+            jira_sites: self
+                .jira_sites
+                .iter()
+                .map(|site| JiraSiteUpdate {
+                    key: site.site_key.clone(),
+                    base_url: site.jira_base_url.clone(),
+                    email_env: site.jira_email_env.clone(),
+                    api_token_env: site.jira_api_token_env.clone(),
+                    email_value: Some(site.jira_email.clone()),
+                    api_token_value: Some(site.jira_api_token.clone()),
+                    enabled: true,
+                })
+                .collect(),
+        }
     }
 }
 
@@ -589,86 +748,6 @@ fn derive_jira_site_key(jira_base_url: &str) -> anyhow::Result<String> {
     Ok(key)
 }
 
-fn render_config(input: &SetupInput) -> String {
-    let mut contents = format!(
-        "[toggl]\nworkspace_id = {}\napi_token_env = \"{}\"\n\n[runtime]\nsqlite_path = \"{}\"\n\n[schedule]\nenabled = true\ninterval_minutes = {}\n\n[jira]\n",
-        input.toggl_workspace_id,
-        TOGGL_API_TOKEN_ENV,
-        toml_escape(&input.sqlite_path),
-        input.schedule_interval_minutes,
-    );
-
-    for site in &input.jira_sites {
-        contents.push_str(&format!(
-            "\n[[jira.sites]]\nkey = \"{}\"\nbase_url = \"{}\"\nemail_env = \"{}\"\napi_token_env = \"{}\"\nenabled = true\n",
-            toml_escape(&site.site_key),
-            toml_escape(&site.jira_base_url),
-            site.jira_email_env,
-            site.jira_api_token_env,
-        ));
-    }
-
-    contents
-}
-
-fn render_credentials(input: &SetupInput) -> String {
-    let mut contents = format!(
-        "{}={}\n",
-        TOGGL_API_TOKEN_ENV,
-        env_escape(&input.toggl_api_token),
-    );
-    for site in &input.jira_sites {
-        contents.push_str(&format!(
-            "{}={}\n{}={}\n",
-            site.jira_email_env,
-            env_escape(&site.jira_email),
-            site.jira_api_token_env,
-            env_escape(&site.jira_api_token),
-        ));
-    }
-    contents
-}
-
-fn write_file(path: &Path, contents: &str) -> io::Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-
-    fs::write(path, contents)
-}
-
-fn write_secret_file(path: &Path, contents: &str) -> io::Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-
-    #[cfg(unix)]
-    {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(contents.as_bytes())?;
-        let mut permissions = file.metadata()?.permissions();
-        permissions.set_mode(0o600);
-        file.set_permissions(permissions)?;
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::write(path, contents)
-    }
-}
-
 fn read_credentials(path: &Path) -> anyhow::Result<HashMap<String, String>> {
     let contents = fs::read_to_string(path)?;
     let mut credentials = HashMap::new();
@@ -689,20 +768,18 @@ fn read_credentials(path: &Path) -> anyhow::Result<HashMap<String, String>> {
     Ok(credentials)
 }
 
-fn print_credential_line(indent: &str, name: &str, value: Option<&String>, show_secrets: bool) {
+fn push_credential_line(
+    lines: &mut Vec<String>,
+    indent: &str,
+    name: &str,
+    value: Option<&String>,
+    show_secrets: bool,
+) {
     match (value, show_secrets) {
-        (Some(value), true) => println!("{indent}{name}: {value}"),
-        (Some(_), false) => println!("{indent}{name}: present (<redacted>)"),
-        (None, _) => println!("{indent}{name}: missing"),
+        (Some(value), true) => lines.push(format!("{indent}{name}: {value}")),
+        (Some(_), false) => lines.push(format!("{indent}{name}: present (<redacted>)")),
+        (None, _) => lines.push(format!("{indent}{name}: missing")),
     }
-}
-
-fn toml_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn env_escape(value: &str) -> String {
-    value.replace('\n', "")
 }
 
 #[cfg(test)]
@@ -808,6 +885,19 @@ mod tests {
             output.contains("Workspace discovery is skipped for piped or non-interactive setup"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn workspace_discovery_request_debug_redacts_token() {
+        let request = ConfigDiscoverTogglWorkspacesRequest {
+            base_url: "https://api.track.toggl.com".to_owned(),
+            api_token: "secret-token".to_owned(),
+        };
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("https://api.track.toggl.com"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(!debug.contains("secret-token"), "{debug}");
     }
 
     #[test]

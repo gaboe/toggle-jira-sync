@@ -1,7 +1,7 @@
 use std::{fmt, sync::Mutex, time::Duration};
 
 use reqwest::Url;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::AppConfig,
@@ -141,7 +141,7 @@ pub struct TogglTimeEntry {
     pub skip_reason: Option<SkipReason>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TogglWorkspace {
     pub id: i64,
     pub name: String,

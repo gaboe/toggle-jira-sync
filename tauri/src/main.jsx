@@ -135,6 +135,166 @@ function waitForMinimumBusy(startedAt) {
   return new Promise((resolve) => setTimeout(resolve, remaining));
 }
 
+function formatElapsedMs(milliseconds) {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`;
+}
+
+function syncActivityCopy(label, command) {
+  const background = label === "background sync";
+  if (command === "dry_run") {
+    return {
+      runningTitle: "Previewing current changes",
+      runningMessage: "Checking Toggl entries and Jira matches. No Jira worklogs are written during preview.",
+      successTitle: "Preview complete",
+      successMessage: "Review the ledger below before you write anything to Jira.",
+      errorTitle: "Preview failed",
+      toastLoading: "Previewing changes…",
+      toastSuccess: "Preview complete.",
+      toastError: "Preview failed",
+      completeLabel: "ready",
+    };
+  }
+  if (background) {
+    return {
+      runningTitle: "Background sync in progress",
+      runningMessage: "The hourly app sync is checking recent Toggl entries and updating Jira in the background.",
+      successTitle: "Background sync complete",
+      successMessage: "The latest hourly sync finished. Review the ledger below if anything needs attention.",
+      errorTitle: "Background sync failed",
+      toastLoading: "Running background sync…",
+      toastSuccess: "Background sync complete.",
+      toastError: "Background sync failed",
+      completeLabel: "synced",
+    };
+  }
+  return {
+    runningTitle: "Writing worklogs to Jira",
+    runningMessage: "Reading recent Toggl entries and writing matching Jira worklogs. Keep this window open until it finishes.",
+    successTitle: "Sync complete",
+    successMessage: "The latest write finished. Review the ledger below for synced, skipped, or error rows.",
+    errorTitle: "Sync failed",
+    toastLoading: "Writing worklogs to Jira…",
+    toastSuccess: "Sync complete.",
+    toastError: "Sync failed",
+    completeLabel: "synced",
+  };
+}
+
+function summarizeActivityResult(summary, completeLabel) {
+  const nextSummary = summary || { synced_count: 0, skipped_count: 0, error_count: 0 };
+  return `${nextSummary.synced_count} ${completeLabel} · ${nextSummary.skipped_count} skipped · ${nextSummary.error_count} errors`;
+}
+
+function reasonKind(reason) {
+  const normalized = (reason || "").toLowerCase();
+  if (/toggl.*403|failed to fetch toggl entries.*403|toggl http error: 403/.test(normalized)) return "toggl-auth";
+  if (/exists on multiple enabled jira sites|exists on multiple enabled sites/.test(normalized)) return "ambiguous-site";
+  if (/was not found on any enabled jira site|was not found on any enabled site/.test(normalized)) return "missing-site";
+  if (/no valid jira issue key found in toggl description/.test(normalized)) return "missing-issue-key";
+  if (/multiple issue keys found/.test(normalized)) return "multiple-issue-keys";
+  return null;
+}
+
+function summarizeReason(reason) {
+  const value = reason || "-";
+  switch (reasonKind(value)) {
+    case "toggl-auth":
+      return "Toggl auth rejected the request";
+    case "ambiguous-site":
+      return "Issue exists on multiple enabled Jira sites";
+    case "missing-site":
+      return "Issue was not found on any enabled Jira site";
+    case "missing-issue-key":
+      return "No Jira issue key found in the Toggl description";
+    case "multiple-issue-keys":
+      return "Multiple Jira issue keys were found";
+    default:
+      return value;
+  }
+}
+
+function reasonGuidance(row, readOnlyConfig) {
+  const togglConfigStep = readOnlyConfig ? "View tenant configuration, then ask the tenant administrator to update the Toggl token or workspace settings." : "Open Configuration and update the saved Toggl token or workspace settings.";
+  const jiraConfigStep = readOnlyConfig ? "View tenant configuration, then ask the tenant administrator to update the Jira site list." : "Open Configuration and update the enabled Jira site list.";
+  switch (reasonKind(row?.reason)) {
+    case "toggl-auth":
+      return {
+        title: "Reconnect Toggl before trying again",
+        body: "Toggl rejected the request. The saved API token may be expired, wrong for this workspace, or missing the right workspace access.",
+        steps: [
+          togglConfigStep,
+          readOnlyConfig ? "Confirm the current workspace ID still belongs to the saved tenant token." : "Paste a current Toggl API token and confirm the workspace ID matches that token.",
+          "Run Preview changes again after saving.",
+        ],
+        configCta: true,
+      };
+    case "ambiguous-site":
+      return {
+        title: "Narrow this issue to one enabled Jira site",
+        body: "This issue key resolved on more than one enabled Jira site, so sync stopped rather than writing to the wrong place.",
+        steps: [
+          jiraConfigStep,
+          readOnlyConfig ? "Ask the tenant administrator to disable the extra site or add the missing tenant so this issue resolves to one place." : "Add the missing site if you expect one more Jira tenant, or disable the extra site that should not receive this issue.",
+          "Run Preview changes again after the site list is correct.",
+        ],
+        configCta: true,
+      };
+    case "missing-site":
+      return {
+        title: "Add or enable the Jira site that owns this issue",
+        body: "The issue key could not be found on any enabled Jira site, so there is nowhere safe to write this worklog yet.",
+        steps: [
+          jiraConfigStep,
+          readOnlyConfig ? "Ask the tenant administrator to add another Jira site or enable the right one if this issue lives in a different tenant." : "Add another Jira site or enable the right one if this issue lives in a different Jira tenant.",
+          `Check that ${row.issue !== "-" ? row.issue : "the issue key"} exists in Jira, then preview again.`,
+        ],
+        configCta: true,
+      };
+    case "missing-issue-key":
+      return {
+        title: "Add one Jira issue key to the Toggl description",
+        body: "The Toggl entry description does not contain a valid Jira issue key, so the sync cannot decide where to create the worklog.",
+        steps: [
+          "Edit the Toggl entry description and add one issue key such as PROJ-123.",
+          "Keep only one Jira issue key in the description.",
+          "Run Preview changes again after the Toggl entry is updated.",
+        ],
+        configCta: false,
+      };
+    case "multiple-issue-keys":
+      return {
+        title: "Keep only one Jira issue key in the Toggl description",
+        body: "The description matched more than one Jira issue key, so sync stopped instead of guessing which issue should receive the worklog.",
+        steps: [
+          "Edit the Toggl entry description and leave only the single Jira issue key that should receive the worklog.",
+          "Remove any extra key-like text from notes or copied links.",
+          "Run Preview changes again after the Toggl entry is updated.",
+        ],
+        configCta: false,
+      };
+    default:
+      return null;
+  }
+}
+
+function siteResolutionPrompt(rows, readOnlyConfig) {
+  const affected = rows.filter((row) => ["ambiguous-site", "missing-site"].includes(reasonKind(row.reason)));
+  if (affected.length === 0) return null;
+  const hasAmbiguous = affected.some((row) => reasonKind(row.reason) === "ambiguous-site");
+  return {
+    count: affected.length,
+    title: hasAmbiguous ? "Jira site selection needs attention" : "A Jira site is missing from configuration",
+    message: readOnlyConfig
+      ? `${affected.length} worklogs need Jira site changes. View tenant configuration, then ask the tenant administrator to add or enable the right site.`
+      : `${affected.length} worklogs need Jira site changes. Open Configuration to add another Jira site or enable the right one, then preview again.`,
+    buttonLabel: readOnlyConfig ? "View tenant config" : "Open configuration",
+  };
+}
+
 function App() {
   const [view, setView] = createSignal("overview");
   const [snapshot, setSnapshot] = createSignal(null);
@@ -143,6 +303,7 @@ function App() {
   const [dateFilter, setDateFilter] = createSignal("");
   const [loadError, setLoadError] = createSignal("");
   const [busyCommand, setBusyCommand] = createSignal(null);
+  const [activity, setActivity] = createSignal(null);
   const [now, setNow] = createSignal(Date.now());
   const [guiBackgroundSyncEnabled, setGuiBackgroundSyncEnabled] = createSignal(true);
   const [nextBackgroundSyncAt, setNextBackgroundSyncAt] = createSignal(null);
@@ -198,7 +359,7 @@ function App() {
 
   onMount(() => {
     refresh();
-    const interval = setInterval(() => setNow(Date.now()), 30_000);
+    const interval = setInterval(() => setNow(Date.now()), 1_000);
     onCleanup(() => {
       clearInterval(interval);
       clearTimeout(backgroundTimer);
@@ -225,16 +386,39 @@ function App() {
   async function runAction(label, command) {
     if (busyCommand()) return;
     const startedAt = performance.now();
-    const loadingToast = toast.loading(`Running ${label}…`);
+    const startedOn = Date.now();
+    const copy = syncActivityCopy(label, command);
+    const loadingToast = toast.loading(copy.toastLoading);
     setBusyCommand(command);
+    setActivity({ status: "running", command, title: copy.runningTitle, message: copy.runningMessage, startedAt: startedOn });
     try {
-      setSnapshot(command === "dry_run" ? await api.dryRun() : await api.sync());
+      const nextSnapshot = command === "dry_run" ? await api.dryRun() : await api.sync();
+      setSnapshot(nextSnapshot);
       await waitForMinimumBusy(startedAt);
       toast.dismiss(loadingToast);
-      toast.success(`${label} finished.`);
+      toast.success(copy.toastSuccess);
+      setActivity({
+        status: "success",
+        command,
+        title: copy.successTitle,
+        message: summarizeActivityResult(nextSnapshot?.status?.summary, copy.completeLabel),
+        detail: copy.successMessage,
+        startedAt: startedOn,
+        finishedAt: Date.now(),
+      });
     } catch (error) {
       toast.dismiss(loadingToast);
-      toast.error(String(error));
+      const message = String(error);
+      toast.error(`${copy.toastError}: ${message}`);
+      setActivity({
+        status: "error",
+        command,
+        title: copy.errorTitle,
+        message,
+        detail: copy.runningMessage,
+        startedAt: startedOn,
+        finishedAt: Date.now(),
+      });
     } finally {
       setBusyCommand(null);
     }
@@ -333,8 +517,8 @@ function App() {
         setView={setView}
       actions={
         <>
-          <ActionButton label="Preview changes" command="dry_run" busyCommand={busyCommand()} onClick={() => runAction("dry-run", "dry_run")} secondary description="No Jira writes" />
-          <ActionButton label="Write to Jira" busyLabel="Running sync…" command="sync" busyCommand={busyCommand()} onClick={() => runAction("sync", "sync")} description="Creates worklogs" />
+          <ActionButton label="Preview changes" busyLabel="Previewing…" command="dry_run" busyCommand={busyCommand()} onClick={() => runAction("preview", "dry_run")} secondary description="No Jira writes" />
+          <ActionButton label="Write to Jira" busyLabel="Writing…" command="sync" busyCommand={busyCommand()} onClick={() => runAction("sync", "sync")} description="Creates worklogs" />
         </>
       }
     >
@@ -357,6 +541,10 @@ function App() {
                 months={months()}
                 activeMonth={activeMonth()}
                 setSelectedMonth={setSelectedMonth}
+                activity={activity()}
+                now={now()}
+                setView={setView}
+                readOnlyConfig={isTenantMode}
               />
             </section>
           </Match>
@@ -437,9 +625,23 @@ function Overview(props) {
   const activeMonthIndex = () => props.months.indexOf(props.activeMonth);
   const previousMonth = () => props.months[activeMonthIndex() + 1];
   const nextMonth = () => props.months[activeMonthIndex() - 1];
+  const configPrompt = createMemo(() => siteResolutionPrompt(props.allRows, props.readOnlyConfig));
   return (
     <>
       <SummaryMetrics summary={props.summary} />
+      <Show when={props.activity}><SyncActivity activity={props.activity} now={props.now} /></Show>
+      <Show when={configPrompt()}>
+        {(prompt) => (
+          <section class="panel overview-prompt">
+            <div class="overview-prompt-copy">
+              <p class="panel-kicker">Configuration</p>
+              <h2>{prompt().title}</h2>
+              <p>{prompt().message}</p>
+            </div>
+            <button type="button" class="secondary" onClick={() => props.setView("configuration")}>{prompt().buttonLabel}</button>
+          </section>
+        )}
+      </Show>
       <div class="worklog-layout">
         <section class="panel worklog-list">
           <WorklogHeader
@@ -457,9 +659,42 @@ function Overview(props) {
           />
           <WorklogTable rows={props.rows} selected={props.selected} setSelected={props.setSelected} />
         </section>
-        <IssuePanel row={props.selectedRow} openUrl={props.openUrl} />
+        <IssuePanel row={props.selectedRow} openUrl={props.openUrl} setView={props.setView} readOnlyConfig={props.readOnlyConfig} />
       </div>
     </>
+  );
+}
+
+function SyncActivity(props) {
+  const duration = () => {
+    if (!props.activity) return "0s";
+    const finishedAt = props.activity.finishedAt || props.now;
+    return formatElapsedMs(finishedAt - props.activity.startedAt);
+  };
+  const timing = () => {
+    if (!props.activity) return "";
+    if (props.activity.status === "running") {
+      return `Started at ${formatClock(new Date(props.activity.startedAt))} · ${duration()} elapsed`;
+    }
+    return `Last run took ${duration()} · finished at ${formatClock(new Date(props.activity.finishedAt || props.activity.startedAt))}`;
+  };
+  const lozengeTone = () => (props.activity.status === "success" ? "synced" : props.activity.status);
+  const lozengeLabel = () => (props.activity.status === "success" ? "complete" : props.activity.status);
+  return (
+    <section class={`panel sync-activity ${props.activity.status}`}>
+      <div class="sync-activity-copy">
+        <p class="panel-kicker">Sync activity</p>
+        <div class="sync-activity-heading">
+          <h2>{props.activity.title}</h2>
+          <span class={`lozenge ${lozengeTone()}`}>{lozengeLabel()}</span>
+        </div>
+        <p>{props.activity.message}</p>
+      </div>
+      <div class="sync-activity-meta">
+        <p class="activity-timing">{timing()}</p>
+        <Show when={props.activity.detail}><p class="activity-detail">{props.activity.detail}</p></Show>
+      </div>
+    </section>
   );
 }
 
@@ -556,7 +791,7 @@ function WorklogRow(props) {
       <td>{props.row.site}</td>
       <td>{props.row.worklog}</td>
       <td><StatusLozenge status={props.row.status} /></td>
-      <td class="reason-cell" title={props.row.reason}>{props.row.reason}</td>
+      <td class="reason-cell" title={props.row.reason}><span>{props.row.reasonSummary}</span></td>
     </tr>
   );
 }
@@ -570,6 +805,7 @@ function StatusLozenge(props) {
 }
 
 function IssuePanel(props) {
+  const guidance = () => props.row ? reasonGuidance(props.row, props.readOnlyConfig) : null;
   return (
     <aside class="issue-panel">
       <Show when={props.row} fallback={<p class="empty-detail">Select a worklog to inspect its Jira links.</p>}>
@@ -589,8 +825,28 @@ function IssuePanel(props) {
             <div><dt>Site</dt><dd>{row().site}</dd></div>
             <div><dt>Worklog</dt><dd>{row().worklog}</dd></div>
           </dl>
-          <div class="detail-reason"><span>Reason</span><p>{row().reason}</p></div>
-          <div class="detail-links"><button class="link-button" disabled={!row().issueUrl} onClick={() => props.openUrl(row().issueUrl)}>Open issue</button><button class="link-button" disabled={!row().worklogUrl} onClick={() => props.openUrl(row().worklogUrl)}>Open worklog</button></div>
+          <div class="detail-reason">
+            <span>Reason</span>
+            <p>{row().reason}</p>
+            <Show when={guidance()}>
+              {(help) => (
+                <div class="detail-guidance">
+                  <strong>{help().title}</strong>
+                  <p>{help().body}</p>
+                  <ul class="detail-steps">
+                    <For each={help().steps}>{(step) => <li>{step}</li>}</For>
+                  </ul>
+                </div>
+              )}
+            </Show>
+          </div>
+          <div class="detail-links">
+            <Show when={guidance()?.configCta}>
+              <button class="secondary" type="button" onClick={() => props.setView("configuration")}>{props.readOnlyConfig ? "View tenant config" : "Open configuration"}</button>
+            </Show>
+            <button class="link-button" disabled={!row().issueUrl} onClick={() => props.openUrl(row().issueUrl)}>Open issue</button>
+            <button class="link-button" disabled={!row().worklogUrl} onClick={() => props.openUrl(row().worklogUrl)}>Open worklog</button>
+          </div>
         </>}
       </Show>
     </aside>
@@ -621,7 +877,14 @@ function Configuration(props) {
       <label class="check"><input name="schedule_enabled" type="checkbox" checked={props.config.schedule_enabled} disabled={disabled()} /> Enable OS schedule</label>
       <Show when={!props.readOnly}><label class="check"><input name="gui_background_sync_enabled" type="checkbox" checked={props.guiBackgroundSyncEnabled} /> Sync hourly while this app is open</label></Show>
       <section class="sites-section full">
-        <div class="site-card-head"><div><h3>Jira sites</h3><span>{sites().length} configured</span></div><Show when={!props.readOnly}><button type="button" class="secondary" onClick={addSite}>Add Jira site</button></Show></div>
+        <div class="site-card-head">
+          <div>
+            <h3>Jira sites</h3>
+            <p class="sites-copy">Add every Jira site that might contain your issue keys. Sync checks each enabled site before it writes a worklog.</p>
+            <span>{sites().length} configured</span>
+          </div>
+          <Show when={!props.readOnly}><button type="button" class="secondary" onClick={addSite}>Add another Jira site</button></Show>
+        </div>
         <For each={sites()}>{(site, index) => (
           <section class="site-card" data-jira-site>
             <div class="site-card-head"><div><h3>Jira site {index() + 1}</h3><span>{site.key || "New site"}</span></div><Show when={!props.readOnly && sites().length > 1}><button type="button" class="danger" onClick={() => removeSite(site.local_id)}>Remove</button></Show></div>
@@ -672,7 +935,8 @@ function rowView(entry, config, now) {
   const linkSite = site !== "-" ? site : fallbackSite;
   const baseUrl = linkSite ? `https://${linkSite}.atlassian.net` : null;
   const running = entry.stopped_at == null && entry.reason === "running entry";
-  return { date, time: running ? `${start} – running` : `${start} – ${end}`, duration: running ? formatRunningDuration(entry.started_at, now) : formatDuration(entry.duration_seconds), issue, site, worklog, status: running ? "running" : entry.status, reason: running ? "time entry is still running; worklog will be created after it stops" : entry.reason || "-", issueUrl: baseUrl && issue !== "-" ? `${baseUrl}/browse/${issue}` : null, worklogUrl: !running && baseUrl && issue !== "-" && worklog !== "-" ? `${baseUrl}/browse/${issue}?focusedWorklogId=${worklog}` : null };
+  const reason = running ? "time entry is still running; worklog will be created after it stops" : entry.reason || "-";
+  return { date, time: running ? `${start} – running` : `${start} – ${end}`, duration: running ? formatRunningDuration(entry.started_at, now) : formatDuration(entry.duration_seconds), issue, site, worklog, status: running ? "running" : entry.status, reason, reasonSummary: summarizeReason(reason), issueUrl: baseUrl && issue !== "-" ? `${baseUrl}/browse/${issue}` : null, worklogUrl: !running && baseUrl && issue !== "-" && worklog !== "-" ? `${baseUrl}/browse/${issue}?focusedWorklogId=${worklog}` : null };
 }
 
 const root = document.getElementById("root");

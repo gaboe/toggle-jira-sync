@@ -19,8 +19,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app,
-    cli::{SharedPaths, TuiArgs},
+    cli::TuiArgs,
+    local_api::{LocalApiClient, LocalServer},
     report::StatusEntry,
     time::{format_duration, split_status_datetime},
 };
@@ -32,22 +32,32 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
         );
     }
 
-    let (_, config, report) = app::status_report(args.paths.clone(), args.limit)?;
-    let base_urls = app::jira_base_urls(&config);
+    let server = LocalServer::start(args.paths.clone(), None, args.limit).await?;
+    let client = server.client();
+    let snapshot = client.snapshot().await?;
+    let base_urls = snapshot
+        .config
+        .jira_sites
+        .iter()
+        .filter(|site| site.enabled)
+        .map(|site| {
+            (
+                site.key.clone(),
+                site.base_url.trim_end_matches('/').to_owned(),
+            )
+        })
+        .collect();
 
-    let sync_paths = args.paths.clone();
     let mut terminal = ratatui::init();
     let result = run_app(
         &mut terminal,
         TuiApp::new(
-            report.entries,
+            snapshot.status.entries,
             base_urls,
-            config.schedule.enabled,
-            config.schedule.interval_minutes,
+            snapshot.schedule.enabled,
+            snapshot.schedule.interval_minutes,
         ),
-        sync_paths,
-        args.paths.clone(),
-        args.limit,
+        client,
     )
     .await;
     ratatui::restore();
@@ -57,9 +67,7 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
 async fn run_app(
     terminal: &mut DefaultTerminal,
     mut app: TuiApp,
-    sync_paths: SharedPaths,
-    paths: SharedPaths,
-    limit: usize,
+    client: LocalApiClient,
 ) -> anyhow::Result<()> {
     let sync_interval = Duration::from_secs(60 * 60);
     let mut next_hourly_sync = schedule_next_sync(Instant::now(), sync_interval);
@@ -73,7 +81,7 @@ async fn run_app(
             let pending = pending_sync.take().expect("pending sync should exist");
             app.message = match pending.handle.join() {
                 Ok(Ok(())) => {
-                    refresh_rows(&mut app, paths.clone(), limit)?;
+                    refresh_rows(&mut app, &client).await?;
                     finished_sync_message(
                         pending.label,
                         pending.before_counts,
@@ -102,7 +110,7 @@ async fn run_app(
         if pending_sync.is_none() && hourly_sync_due(Instant::now(), next_hourly_sync) {
             app.message = "running hourly sync...".to_owned();
             pending_sync = Some(spawn_sync_action(
-                sync_paths.clone(),
+                client.clone(),
                 false,
                 "hourly sync",
                 status_counts(&app.rows),
@@ -122,7 +130,7 @@ async fn run_app(
                             if pending_sync.is_none() {
                                 app.message = "running dry-run...".to_owned();
                                 pending_sync = Some(spawn_sync_action(
-                                    sync_paths.clone(),
+                                    client.clone(),
                                     true,
                                     "dry-run",
                                     status_counts(&app.rows),
@@ -135,7 +143,7 @@ async fn run_app(
                             if pending_sync.is_none() {
                                 app.message = "running sync...".to_owned();
                                 pending_sync = Some(spawn_sync_action(
-                                    sync_paths.clone(),
+                                    client.clone(),
                                     false,
                                     "sync",
                                     status_counts(&app.rows),
@@ -146,7 +154,7 @@ async fn run_app(
                         }
                         TuiAction::ToggleSchedule => {
                             let enabled = !app.schedule_enabled;
-                            match app::update_schedule(paths.clone(), enabled) {
+                            match client.update_schedule(enabled).await {
                                 Ok(schedule) => {
                                     app.schedule_enabled = schedule.enabled;
                                     app.schedule_interval_minutes = schedule.interval_minutes;
@@ -164,7 +172,7 @@ async fn run_app(
                                 }
                             }
                         }
-                        TuiAction::ExportConfig => match app::export_config(paths.clone()) {
+                        TuiAction::ExportConfig => match client.export_config().await {
                             Ok(result) => {
                                 app.message = format!("configuration exported: {}", result.path);
                             }
@@ -192,7 +200,7 @@ struct PendingSync {
 }
 
 fn spawn_sync_action(
-    paths: SharedPaths,
+    client: LocalApiClient,
     dry_run: bool,
     label: &'static str,
     before_counts: StatusCounts,
@@ -207,7 +215,7 @@ fn spawn_sync_action(
                 .enable_all()
                 .build()
                 .context("failed to start sync runtime")?
-                .block_on(run_sync_action(paths, dry_run))
+                .block_on(run_sync_action(client, dry_run))
         }),
     }
 }
@@ -238,14 +246,19 @@ fn hourly_sync_due(now: Instant, next_sync: Instant) -> bool {
     now >= next_sync
 }
 
-fn refresh_rows(app: &mut TuiApp, paths: SharedPaths, limit: usize) -> anyhow::Result<()> {
-    let (_, _, report) = app::status_report(paths, limit)?;
+async fn refresh_rows(app: &mut TuiApp, client: &LocalApiClient) -> anyhow::Result<()> {
+    let report = client.status().await?;
     app.set_rows(report.entries);
     Ok(())
 }
 
-async fn run_sync_action(paths: SharedPaths, dry_run: bool) -> anyhow::Result<()> {
-    app::run_sync(paths, dry_run, false).await
+async fn run_sync_action(client: LocalApiClient, dry_run: bool) -> anyhow::Result<()> {
+    if dry_run {
+        client.dry_run().await?;
+    } else {
+        client.sync().await?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

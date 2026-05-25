@@ -2,9 +2,11 @@
 
 `toggl-jira-sync server` exposes the shared app API over HTTP for web and desktop clients.
 
+Local clients also use this server core automatically. The Tauri desktop app starts an embedded single-mode loopback server for the app lifetime, and day-to-day terminal commands such as `tjs`, `tjs tui`, `tjs status`, `tjs sync`, and `tjs schedule ...` start an embedded loopback server for the command lifetime. You only need to run `toggl-jira-sync server` manually when you want a long-lived API process for browser development, integrations, or hosted deployments.
+
 ## Single mode
 
-Single mode is the default local mode. It uses the same config, credentials, and SQLite ledger resolution as the CLI and TUI.
+Single mode is the default local mode. It uses the same config, credentials, and SQLite ledger resolution as the CLI, TUI, and desktop GUI.
 
 ```sh
 toggl-jira-sync server --mode single --host 127.0.0.1 --port 8787

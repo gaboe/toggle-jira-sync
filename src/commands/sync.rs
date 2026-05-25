@@ -1,6 +1,7 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::SyncArgs,
@@ -11,6 +12,7 @@ use crate::{
     config::{AppConfig, JiraSiteConfig},
     db::{Database, NewSyncRun, NewTogglEntry, StoredJiraWorklogLink},
     jira::{JiraClient, JiraWritePacing, JiraWritePacingScope, TokioSleeper},
+    local_api::LocalServer,
     report::DryRunReport,
     sync::{
         executor::{execute_plan, ExecutorOptions, ExecutorReport},
@@ -24,35 +26,115 @@ use crate::{
     toggl::{TogglClient, TogglClientConfig, TogglTimeEntry},
 };
 
-pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
-    let config_path = resolve_config_path(args.paths.config.clone())?;
-    let credentials = None;
-    run_with_config(args, config_path, credentials).await
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum SyncCommandReport {
+    DryRun {
+        report: DryRunReport,
+    },
+    Sync {
+        succeeded: usize,
+        failed: usize,
+        statuses: Vec<String>,
+    },
 }
 
-pub async fn run_with_credentials(
-    args: SyncArgs,
-    credentials_path: std::path::PathBuf,
-) -> anyhow::Result<()> {
-    let config_path = resolve_config_path(args.paths.config.clone())?;
-    let credentials = Some(load_credentials_from_path(&credentials_path)?);
-    run_with_config(args, config_path, credentials).await
+impl SyncCommandReport {
+    pub fn print(&self, json: bool) -> anyhow::Result<()> {
+        match self {
+            Self::DryRun { report } => {
+                if json {
+                    println!("{}", report.to_json_string()?);
+                } else {
+                    println!("{}", report.to_human_string());
+                }
+            }
+            Self::Sync {
+                succeeded,
+                failed,
+                statuses,
+            } => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "mode": "sync",
+                            "succeeded": succeeded,
+                            "failed": failed,
+                            "statuses": statuses,
+                        }))?
+                    );
+                } else {
+                    println!("sync: succeeded={succeeded} failed={failed}");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
+    let server = LocalServer::start(args.paths.clone(), None, 200).await?;
+    let report = server
+        .client()
+        .sync_command(args.dry_run, args.cleanup_deleted)
+        .await?;
+    if !args.quiet {
+        report.print(args.json)?;
+    }
+    Ok(())
+}
+
+pub async fn run_direct(args: SyncArgs) -> anyhow::Result<()> {
+    let json = args.json;
+    let quiet = args.quiet;
+    let report = sync_report(args, None).await?;
+    if !quiet {
+        report.print(json)?;
+    }
+    Ok(())
+}
+
+pub async fn run_with_credentials(args: SyncArgs, credentials_path: PathBuf) -> anyhow::Result<()> {
+    let json = args.json;
+    let quiet = args.quiet;
+    let report = sync_report(args, Some(load_credentials_from_path(&credentials_path)?)).await?;
+    if !quiet {
+        report.print(json)?;
+    }
+    Ok(())
 }
 
 pub async fn run_with_isolated_credentials(
     args: SyncArgs,
-    credentials_path: std::path::PathBuf,
+    credentials_path: PathBuf,
 ) -> anyhow::Result<()> {
+    let json = args.json;
+    let quiet = args.quiet;
+    let report = sync_report(
+        args,
+        Some(load_isolated_credentials_from_path(&credentials_path)?),
+    )
+    .await?;
+    if !quiet {
+        report.print(json)?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn sync_report(
+    args: SyncArgs,
+    credentials: Option<LocalCredentials>,
+) -> anyhow::Result<SyncCommandReport> {
     let config_path = resolve_config_path(args.paths.config.clone())?;
-    let credentials = Some(load_isolated_credentials_from_path(&credentials_path)?);
     run_with_config(args, config_path, credentials).await
 }
 
 async fn run_with_config(
     args: SyncArgs,
-    config_path: std::path::PathBuf,
+    config_path: PathBuf,
     credentials: Option<LocalCredentials>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SyncCommandReport> {
     let uses_default_config = config_path == resolve_config_path(None)?;
     let config = AppConfig::from_path(&config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
@@ -125,45 +207,22 @@ async fn run_with_config(
 
         lock.release().context("failed to release sync lock")?;
 
-        if args.quiet {
-            return Ok(());
-        }
-
-        if args.json {
-            println!("{}", report.to_json_string()?);
-        } else {
-            println!("{}", report.to_human_string());
-        }
-
-        return Ok(());
+        return Ok(SyncCommandReport::DryRun { report });
     }
 
     let report = execute_destructive_plan(&config, &credentials, &plan, &database).await?;
 
     lock.release().context("failed to release sync lock")?;
 
-    if args.quiet {
-        return Ok(());
-    }
-
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "mode": "sync",
-                "succeeded": report.succeeded,
-                "failed": report.failed,
-                "statuses": report.statuses.iter().map(|status| format!("{status:?}")).collect::<Vec<_>>(),
-            }))?
-        );
-    } else {
-        println!(
-            "sync: succeeded={} failed={}",
-            report.succeeded, report.failed
-        );
-    }
-
-    Ok(())
+    Ok(SyncCommandReport::Sync {
+        succeeded: report.succeeded,
+        failed: report.failed,
+        statuses: report
+            .statuses
+            .iter()
+            .map(|status| format!("{status:?}"))
+            .collect(),
+    })
 }
 
 fn cleanup_missing_toggl_entries(

@@ -2,61 +2,74 @@ use std::process::Command;
 
 use tauri::Manager;
 use toggl_jira_sync::{
-    app::{self, AppStateSnapshot, ConfigOnlySnapshot, ConfigSnapshot, ConfigUpdate, DeleteLocalDataResult, ExportConfigResult, ScheduleSnapshot},
-    cli::SharedPaths,
+    app::{
+        AppStateSnapshot, ConfigOnlySnapshot, ConfigSnapshot, ConfigUpdate, DeleteLocalDataResult,
+        ExportConfigResult, ScheduleSnapshot,
+    },
     format_error_chain,
+    local_api::LocalApiClient,
     report::StatusReport,
 };
 
 const STATUS_LIMIT: usize = 200;
 
 #[tauri::command]
-fn snapshot() -> Result<AppStateSnapshot, String> {
-    app::snapshot(default_paths(), STATUS_LIMIT).map_err(format_tauri_error)
+async fn snapshot(api: tauri::State<'_, LocalApiClient>) -> Result<AppStateSnapshot, String> {
+    api.snapshot().await.map_err(format_tauri_error)
 }
 
 #[tauri::command]
-fn config_snapshot() -> Result<ConfigOnlySnapshot, String> {
-    app::config_snapshot(default_paths()).map_err(format_tauri_error)
+async fn config_snapshot(
+    api: tauri::State<'_, LocalApiClient>,
+) -> Result<ConfigOnlySnapshot, String> {
+    api.config_snapshot().await.map_err(format_tauri_error)
 }
 
 #[tauri::command]
-fn status() -> Result<StatusReport, String> {
-    app::status_report(default_paths(), STATUS_LIMIT)
-        .map(|(_, _, report)| report)
+async fn status(api: tauri::State<'_, LocalApiClient>) -> Result<StatusReport, String> {
+    api.status().await.map_err(format_tauri_error)
+}
+
+#[tauri::command]
+async fn dry_run(api: tauri::State<'_, LocalApiClient>) -> Result<AppStateSnapshot, String> {
+    api.dry_run().await.map_err(format_tauri_error)
+}
+
+#[tauri::command]
+async fn sync(api: tauri::State<'_, LocalApiClient>) -> Result<AppStateSnapshot, String> {
+    api.sync().await.map_err(format_tauri_error)
+}
+
+#[tauri::command]
+async fn toggle_schedule(
+    api: tauri::State<'_, LocalApiClient>,
+    enabled: bool,
+) -> Result<ScheduleSnapshot, String> {
+    api.update_schedule(enabled)
+        .await
         .map_err(format_tauri_error)
 }
 
 #[tauri::command]
-async fn dry_run() -> Result<AppStateSnapshot, String> {
-    run_sync_off_thread(true).await?;
-    snapshot()
+async fn save_config(
+    api: tauri::State<'_, LocalApiClient>,
+    update: ConfigUpdate,
+) -> Result<ConfigSnapshot, String> {
+    api.save_config(&update).await.map_err(format_tauri_error)
 }
 
 #[tauri::command]
-async fn sync() -> Result<AppStateSnapshot, String> {
-    run_sync_off_thread(false).await?;
-    snapshot()
+async fn delete_local_data(
+    api: tauri::State<'_, LocalApiClient>,
+) -> Result<DeleteLocalDataResult, String> {
+    api.delete_local_data().await.map_err(format_tauri_error)
 }
 
 #[tauri::command]
-fn toggle_schedule(enabled: bool) -> Result<ScheduleSnapshot, String> {
-    app::update_schedule(default_paths(), enabled).map_err(format_tauri_error)
-}
-
-#[tauri::command]
-fn save_config(update: ConfigUpdate) -> Result<ConfigSnapshot, String> {
-    app::save_config(default_paths(), update).map_err(format_tauri_error)
-}
-
-#[tauri::command]
-fn delete_local_data() -> Result<DeleteLocalDataResult, String> {
-    app::delete_local_data(default_paths()).map_err(format_tauri_error)
-}
-
-#[tauri::command]
-fn export_config() -> Result<ExportConfigResult, String> {
-    app::export_config(default_paths()).map_err(format_tauri_error)
+async fn export_config(
+    api: tauri::State<'_, LocalApiClient>,
+) -> Result<ExportConfigResult, String> {
+    api.export_config().await.map_err(format_tauri_error)
 }
 
 #[tauri::command]
@@ -77,26 +90,6 @@ fn open_url(url: String) -> Result<(), String> {
     }
 }
 
-fn default_paths() -> SharedPaths {
-    SharedPaths {
-        config: None,
-        db: None,
-    }
-}
-
-async fn run_sync_off_thread(dry_run: bool) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| format!("failed to start sync runtime: {error}"))?
-            .block_on(app::run_sync(default_paths(), dry_run, !dry_run))
-            .map_err(format_tauri_error)
-    })
-    .await
-    .map_err(|error| format!("sync task failed: {error}"))?
-}
-
 fn format_tauri_error(error: anyhow::Error) -> String {
     format_error_chain(&error)
 }
@@ -104,11 +97,9 @@ fn format_tauri_error(error: anyhow::Error) -> String {
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
-            let listener = tauri::async_runtime::block_on(toggl_jira_sync::server::bind(
-                "127.0.0.1",
-                0,
-            ))
-            .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
+            let listener =
+                tauri::async_runtime::block_on(toggl_jira_sync::server::bind("127.0.0.1", 0))
+                    .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
             let local_addr = listener
                 .local_addr()
                 .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
@@ -117,7 +108,10 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = toggl_jira_sync::server::serve_listener(
                     listener,
-                    default_paths(),
+                    toggl_jira_sync::cli::SharedPaths {
+                        config: None,
+                        db: None,
+                    },
                     None,
                     STATUS_LIMIT,
                     toggl_jira_sync::cli::ServerMode::Single,
@@ -128,6 +122,8 @@ fn main() {
                     eprintln!("embedded server failed: {error}");
                 }
             });
+
+            app.manage(LocalApiClient::new(api_base_url.clone()));
 
             if let Some(window) = app.get_webview_window("main") {
                 window.eval(&format!(

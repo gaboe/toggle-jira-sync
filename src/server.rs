@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -16,11 +16,22 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use crate::{
     app::{
         self, AppStateSnapshot, ConfigOnlySnapshot, ConfigSnapshot, ConfigUpdate,
-        DeleteLocalDataResult, ExportConfigResult, ScheduleSnapshot,
+        DeleteLocalDataResult, ExportConfigResult, ScheduleCommandStatus, ScheduleSnapshot,
     },
-    cli::{ServerArgs, ServerMode, SharedPaths},
+    cli::{DoctorArgs, RecoverArgs, ServerArgs, ServerMode, SharedPaths, SyncArgs},
+    commands::{
+        config::{
+            ConfigDiscoverTogglWorkspacesReport, ConfigDiscoverTogglWorkspacesRequest,
+            ConfigSetupWriteReport, ConfigSetupWriteRequest, ConfigShowReport,
+            ConfigValidateReport,
+        },
+        doctor::DoctorCommandReport,
+        recover::RecoveryCommandReport,
+        sync::SyncCommandReport,
+    },
     format_error_chain,
     report::StatusReport,
+    toggl::TogglClient,
 };
 
 #[derive(Clone)]
@@ -51,7 +62,24 @@ struct HealthResponse {
 
 #[derive(Debug, Deserialize)]
 struct ScheduleUpdate {
-    enabled: bool,
+    enabled: Option<bool>,
+    interval_minutes: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncCommandRequest {
+    dry_run: bool,
+    cleanup_deleted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DoctorCommandRequest {
+    online: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigShowCommandRequest {
+    show_secrets: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,7 +158,25 @@ pub fn router(
             .route("/api/status", get(status))
             .route("/api/sync/dry-run", post(dry_run))
             .route("/api/sync", post(sync))
-            .route("/api/schedule", patch(update_schedule))
+            .route("/api/sync/command", post(sync_command))
+            .route("/api/recover/command", post(recover_command))
+            .route("/api/doctor/command", post(doctor_command))
+            .route("/api/config/show/command", post(config_show_command))
+            .route(
+                "/api/config/validate/command",
+                post(config_validate_command),
+            )
+            .route(
+                "/api/config/setup-write/command",
+                post(config_setup_write_command),
+            )
+            .route(
+                "/api/config/discover-toggl-workspaces/command",
+                post(config_discover_toggl_workspaces_command),
+            )
+            .route("/api/schedule", get(schedule_status).patch(update_schedule))
+            .route("/api/schedule/install", post(install_schedule))
+            .route("/api/schedule/uninstall", post(uninstall_schedule))
             .route("/api/local-data", delete(delete_local_data))
             .route("/api/config/export", post(export_config)),
         ServerMode::Multi => router
@@ -248,34 +294,203 @@ async fn run_sync_off_thread(
     dry_run: bool,
     cleanup_deleted: bool,
 ) -> anyhow::Result<()> {
+    run_sync_command_off_thread(paths, credentials_path, dry_run, cleanup_deleted)
+        .await
+        .map(|_| ())
+}
+
+async fn run_sync_command_off_thread(
+    paths: SharedPaths,
+    credentials_path: Option<PathBuf>,
+    dry_run: bool,
+    cleanup_deleted: bool,
+) -> anyhow::Result<SyncCommandReport> {
     tokio::task::spawn_blocking(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("failed to start sync runtime")?
             .block_on(async move {
-                if let Some(credentials_path) = credentials_path {
-                    app::run_sync_with_isolated_credentials(
-                        paths,
-                        dry_run,
-                        cleanup_deleted,
-                        credentials_path,
+                let args = SyncArgs {
+                    paths,
+                    dry_run,
+                    cleanup_deleted,
+                    json: false,
+                    quiet: true,
+                };
+                let credentials = if let Some(credentials_path) = credentials_path {
+                    Some(
+                        crate::commands::config::load_isolated_credentials_from_path(
+                            &credentials_path,
+                        )?,
                     )
-                    .await
                 } else {
-                    app::run_sync_with_credentials(paths, dry_run, cleanup_deleted, None).await
-                }
+                    None
+                };
+                crate::commands::sync::sync_report(args, credentials).await
             })
     })
     .await
     .context("sync task failed")?
 }
 
+async fn sync_command(
+    State(state): State<Arc<ServerState>>,
+    Json(request): Json<SyncCommandRequest>,
+) -> ApiResult<SyncCommandReport> {
+    run_sync_command_off_thread(
+        state.paths.clone(),
+        state.credentials_path.clone(),
+        request.dry_run,
+        request.cleanup_deleted,
+    )
+    .await
+    .map(Json)
+    .map_err(ApiError::from)
+}
+
+async fn run_recover_command_off_thread(
+    paths: SharedPaths,
+    credentials_path: Option<PathBuf>,
+) -> anyhow::Result<RecoveryCommandReport> {
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to start recover runtime")?
+            .block_on(async move {
+                let args = RecoverArgs { paths, json: false };
+                if let Some(credentials_path) = credentials_path {
+                    crate::commands::recover::recover_report_with_isolated_credentials(
+                        args,
+                        credentials_path,
+                    )
+                    .await
+                } else {
+                    crate::commands::recover::recover_report(args, None).await
+                }
+            })
+    })
+    .await
+    .context("recover task failed")?
+}
+
+async fn recover_command(
+    State(state): State<Arc<ServerState>>,
+) -> ApiResult<RecoveryCommandReport> {
+    run_recover_command_off_thread(state.paths.clone(), state.credentials_path.clone())
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn run_doctor_command_off_thread(
+    paths: SharedPaths,
+    credentials_path: Option<PathBuf>,
+    online: bool,
+) -> anyhow::Result<DoctorCommandReport> {
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to start doctor runtime")?
+            .block_on(async move {
+                let args = DoctorArgs { paths, online };
+                if let Some(credentials_path) = credentials_path {
+                    crate::commands::doctor::doctor_report_with_isolated_credentials(
+                        args,
+                        credentials_path,
+                    )
+                    .await
+                } else {
+                    crate::commands::doctor::doctor_report(args, None).await
+                }
+            })
+    })
+    .await
+    .context("doctor task failed")?
+}
+
+async fn doctor_command(
+    State(state): State<Arc<ServerState>>,
+    Json(request): Json<DoctorCommandRequest>,
+) -> ApiResult<DoctorCommandReport> {
+    run_doctor_command_off_thread(
+        state.paths.clone(),
+        state.credentials_path.clone(),
+        request.online,
+    )
+    .await
+    .map(Json)
+    .map_err(ApiError::from)
+}
+
+async fn config_show_command(
+    State(state): State<Arc<ServerState>>,
+    Json(request): Json<ConfigShowCommandRequest>,
+) -> ApiResult<ConfigShowReport> {
+    crate::commands::config::config_show_report(
+        state.paths.clone(),
+        state.credentials_path.clone(),
+        request.show_secrets,
+    )
+    .map(Json)
+    .map_err(ApiError::from)
+}
+
+async fn config_validate_command(
+    State(state): State<Arc<ServerState>>,
+) -> ApiResult<ConfigValidateReport> {
+    crate::commands::config::config_validate_report(state.paths.clone())
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn config_setup_write_command(
+    State(state): State<Arc<ServerState>>,
+    Json(request): Json<ConfigSetupWriteRequest>,
+) -> ApiResult<ConfigSetupWriteReport> {
+    crate::commands::config::config_setup_write(
+        state.paths.clone(),
+        state.credentials_path.clone(),
+        request,
+    )
+    .map(Json)
+    .map_err(ApiError::from)
+}
+
+async fn config_discover_toggl_workspaces_command(
+    Json(request): Json<ConfigDiscoverTogglWorkspacesRequest>,
+) -> ApiResult<ConfigDiscoverTogglWorkspacesReport> {
+    TogglClient::list_workspaces(&request.base_url, &request.api_token)
+        .await
+        .map(|workspaces| Json(ConfigDiscoverTogglWorkspacesReport { workspaces }))
+        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))
+}
+
+async fn schedule_status(
+    State(state): State<Arc<ServerState>>,
+) -> ApiResult<ScheduleCommandStatus> {
+    app::schedule_status(state.paths.clone())
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn install_schedule(State(state): State<Arc<ServerState>>) -> ApiResult<ScheduleSnapshot> {
+    app::install_schedule(state.paths.clone())
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn uninstall_schedule(State(_state): State<Arc<ServerState>>) -> ApiResult<()> {
+    app::uninstall_schedule().map(Json).map_err(ApiError::from)
+}
+
 async fn update_schedule(
     State(state): State<Arc<ServerState>>,
     Json(update): Json<ScheduleUpdate>,
 ) -> ApiResult<ScheduleSnapshot> {
-    app::update_schedule(state.paths.clone(), update.enabled)
+    app::set_schedule(state.paths.clone(), update.interval_minutes, update.enabled)
         .map(Json)
         .map_err(ApiError::from)
 }
@@ -534,9 +749,11 @@ fn token_hash(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AppConfig;
     use axum::body::Body;
     use axum::http::{header, Method, Request, StatusCode};
     use http_body_util::BodyExt;
+    use httpmock::MockServer;
     use rusqlite::params;
     use tower::util::ServiceExt;
 
@@ -574,6 +791,41 @@ mod tests {
             Request::builder()
                 .uri("/api/snapshot")
                 .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn multi_mode_does_not_expose_unscoped_workspace_discovery() {
+        let tenant_db = tempfile::NamedTempFile::new().expect("tenant db");
+
+        let response = router(
+            SharedPaths {
+                config: None,
+                db: None,
+            },
+            None,
+            200,
+            ServerMode::Multi,
+            Some(tenant_db.path().to_path_buf()),
+        )
+        .expect("router")
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/config/discover-toggl-workspaces/command")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "base_url": "https://api.track.toggl.com",
+                        "api_token": "do-not-expose",
+                    })
+                    .to_string(),
+                ))
                 .expect("request"),
         )
         .await
@@ -899,6 +1151,280 @@ api_token_env = "ACME_JIRA_API_TOKEN"
             credentials.contains("ACME_JIRA_API_TOKEN=jira-token"),
             "{credentials}"
         );
+    }
+
+    #[tokio::test]
+    async fn single_mode_discovers_toggl_workspaces_without_returning_token() {
+        let toggl = MockServer::start();
+        let workspaces_mock = toggl.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/api/v9/me/workspaces")
+                .header(
+                    "authorization",
+                    "Basic ZGlzY292ZXJ5LXRva2VuOmFwaV90b2tlbg==",
+                );
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"[{"id":700001,"name":"Engineering"}]"#);
+        });
+
+        let response = single_router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/config/discover-toggl-workspaces/command")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "base_url": toggl.base_url(),
+                            "api_token": "discovery-token",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        workspaces_mock.assert();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body_text = String::from_utf8(body.to_vec()).expect("body utf-8");
+        assert!(!body_text.contains("discovery-token"), "{body_text}");
+        let json: serde_json::Value = serde_json::from_str(&body_text).expect("json");
+        assert_eq!(json["workspaces"][0]["id"], 700001);
+        assert_eq!(json["workspaces"][0]["name"], "Engineering");
+    }
+
+    #[tokio::test]
+    async fn single_mode_exposes_schedule_status_and_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let db_path = dir.path().join("sync.sqlite");
+        write_test_config(&config_path, &db_path, "https://api.track.toggl.com");
+
+        let status_response = router(
+            SharedPaths {
+                config: Some(config_path.clone()),
+                db: Some(db_path.clone()),
+            },
+            None,
+            200,
+            ServerMode::Single,
+            None,
+        )
+        .expect("router")
+        .oneshot(
+            Request::builder()
+                .uri("/api/schedule")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(status_response.status(), StatusCode::OK);
+
+        let update_response = router(
+            SharedPaths {
+                config: Some(config_path.clone()),
+                db: Some(db_path),
+            },
+            None,
+            200,
+            ServerMode::Single,
+            None,
+        )
+        .expect("router")
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri("/api/schedule")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "enabled": false,
+                        "interval_minutes": 45,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert_eq!(update_response.status(), StatusCode::OK);
+
+        let config = AppConfig::from_path(config_path).expect("updated config");
+        assert!(!config.schedule.enabled);
+        assert_eq!(config.schedule.interval_minutes, 45);
+    }
+
+    #[tokio::test]
+    async fn single_mode_sync_command_uses_server_route() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let db_path = dir.path().join("sync.sqlite");
+        write_test_config(&config_path, &db_path, "https://api.track.toggl.com");
+        let missing_token = "TJS_MISSING_TOKEN_FOR_SYNC_COMMAND_TEST";
+        std::env::remove_var(missing_token);
+        let config = std::fs::read_to_string(&config_path).expect("config");
+        std::fs::write(
+            &config_path,
+            config.replace("TOGGL_API_TOKEN", missing_token),
+        )
+        .expect("config");
+
+        let response = router(
+            SharedPaths {
+                config: Some(config_path),
+                db: Some(db_path),
+            },
+            None,
+            200,
+            ServerMode::Single,
+            None,
+        )
+        .expect("router")
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/sync/command")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "dry_run": true,
+                        "cleanup_deleted": false,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(json["error"]
+            .as_str()
+            .expect("error")
+            .contains("missing env var TJS_MISSING_TOKEN_FOR_SYNC_COMMAND_TEST"));
+    }
+
+    #[tokio::test]
+    async fn single_mode_doctor_command_uses_server_route() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let db_path = dir.path().join("sync.sqlite");
+        write_test_config(&config_path, &db_path, "https://api.track.toggl.com");
+        let missing_token = "TJS_MISSING_TOKEN_FOR_DOCTOR_COMMAND_TEST";
+        std::env::remove_var(missing_token);
+        let config = std::fs::read_to_string(&config_path).expect("config");
+        std::fs::write(
+            &config_path,
+            config.replace("TOGGL_API_TOKEN", missing_token),
+        )
+        .expect("config");
+
+        let response = router(
+            SharedPaths {
+                config: Some(config_path),
+                db: Some(db_path),
+            },
+            None,
+            200,
+            ServerMode::Single,
+            None,
+        )
+        .expect("router")
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/doctor/command")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "online": false }).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(json["failures"]
+            .as_array()
+            .expect("failures")
+            .iter()
+            .any(|failure| failure
+                .as_str()
+                .expect("failure")
+                .contains("missing env var TJS_MISSING_TOKEN_FOR_DOCTOR_COMMAND_TEST")));
+    }
+
+    #[tokio::test]
+    async fn single_mode_recover_command_uses_server_route() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let db_path = dir.path().join("sync.sqlite");
+        write_test_config(&config_path, &db_path, "https://api.track.toggl.com");
+        let missing_token = "TJS_MISSING_TOKEN_FOR_RECOVER_COMMAND_TEST";
+        std::env::remove_var(missing_token);
+        let config = std::fs::read_to_string(&config_path).expect("config");
+        std::fs::write(
+            &config_path,
+            config.replace("TOGGL_API_TOKEN", missing_token),
+        )
+        .expect("config");
+
+        let response = router(
+            SharedPaths {
+                config: Some(config_path),
+                db: Some(db_path),
+            },
+            None,
+            200,
+            ServerMode::Single,
+            None,
+        )
+        .expect("router")
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/recover/command")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(json["error"]
+            .as_str()
+            .expect("error")
+            .contains("missing env var TJS_MISSING_TOKEN_FOR_RECOVER_COMMAND_TEST"));
     }
 
     fn single_router() -> Router {

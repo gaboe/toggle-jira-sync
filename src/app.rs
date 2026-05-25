@@ -1,5 +1,11 @@
 use std::{collections::HashMap, env, fs, path::PathBuf};
 
+#[cfg(unix)]
+use std::io::Write;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
@@ -14,26 +20,34 @@ use crate::{
     report::StatusReport,
 };
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppStateSnapshot {
     pub status: StatusReport,
     pub schedule: ScheduleSnapshot,
     pub config: ConfigSnapshot,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigOnlySnapshot {
     pub schedule: ScheduleSnapshot,
     pub config: ConfigSnapshot,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleSnapshot {
     pub enabled: bool,
     pub interval_minutes: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleCommandStatus {
+    pub enabled: bool,
+    pub interval_minutes: u32,
+    pub job_path: String,
+    pub job_installed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
     pub path: String,
     pub toggl_workspace_id: i64,
@@ -64,18 +78,18 @@ impl AppStateSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteLocalDataResult {
     pub deleted: bool,
     pub path: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportConfigResult {
     pub path: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JiraSiteSnapshot {
     pub key: String,
     pub base_url: String,
@@ -88,7 +102,7 @@ pub struct JiraSiteSnapshot {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigUpdate {
     pub toggl_workspace_id: i64,
     pub toggl_api_token_env: String,
@@ -103,7 +117,7 @@ pub struct ConfigUpdate {
     pub jira_sites: Vec<JiraSiteUpdate>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JiraSiteUpdate {
     pub key: String,
     pub base_url: String,
@@ -187,41 +201,41 @@ pub fn status_report(
 pub async fn run_sync(
     paths: SharedPaths,
     dry_run: bool,
-    _cleanup_deleted: bool,
+    cleanup_deleted: bool,
 ) -> anyhow::Result<()> {
-    run_sync_with_credentials(paths, dry_run, _cleanup_deleted, None).await
+    run_sync_with_credentials(paths, dry_run, cleanup_deleted, None).await
 }
 
 pub async fn run_sync_with_credentials(
     paths: SharedPaths,
     dry_run: bool,
-    _cleanup_deleted: bool,
+    cleanup_deleted: bool,
     credentials_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let args = SyncArgs {
         paths,
         dry_run,
-        cleanup_deleted: true,
+        cleanup_deleted,
         json: false,
         quiet: true,
     };
     if let Some(credentials_path) = credentials_path {
         return crate::commands::sync::run_with_credentials(args, credentials_path).await;
     }
-    crate::commands::sync::run(SyncArgs { ..args }).await
+    crate::commands::sync::run_direct(SyncArgs { ..args }).await
 }
 
 pub async fn run_sync_with_isolated_credentials(
     paths: SharedPaths,
     dry_run: bool,
-    _cleanup_deleted: bool,
+    cleanup_deleted: bool,
     credentials_path: PathBuf,
 ) -> anyhow::Result<()> {
     crate::commands::sync::run_with_isolated_credentials(
         SyncArgs {
             paths,
             dry_run,
-            cleanup_deleted: true,
+            cleanup_deleted,
             json: false,
             quiet: true,
         },
@@ -230,18 +244,52 @@ pub async fn run_sync_with_isolated_credentials(
     .await
 }
 
-pub fn update_schedule(paths: SharedPaths, enabled: bool) -> anyhow::Result<ScheduleSnapshot> {
+pub fn schedule_status(paths: SharedPaths) -> anyhow::Result<ScheduleCommandStatus> {
     let config_path = resolve_config_path(paths.config)?;
     let config = AppConfig::from_path(&config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
-    schedule::update_schedule_config(&config_path, None, Some(enabled))?;
-    if enabled {
+    let job_path = schedule::job_path()?;
+    Ok(ScheduleCommandStatus {
+        enabled: config.schedule.enabled,
+        interval_minutes: config.schedule.interval_minutes,
+        job_installed: job_path.exists(),
+        job_path: job_path.display().to_string(),
+    })
+}
+
+pub fn install_schedule(paths: SharedPaths) -> anyhow::Result<ScheduleSnapshot> {
+    let config_path = resolve_config_path(paths.config)?;
+    let config = AppConfig::from_path(&config_path)
+        .with_context(|| format!("failed to load config {}", config_path.display()))?;
+    schedule::install_default_job(&config_path, config.schedule.interval_minutes)?;
+    Ok(ScheduleSnapshot {
+        enabled: config.schedule.enabled,
+        interval_minutes: config.schedule.interval_minutes,
+    })
+}
+
+pub fn uninstall_schedule() -> anyhow::Result<()> {
+    schedule::uninstall_job()
+}
+
+pub fn update_schedule(paths: SharedPaths, enabled: bool) -> anyhow::Result<ScheduleSnapshot> {
+    set_schedule(paths, None, Some(enabled))
+}
+
+pub fn set_schedule(
+    paths: SharedPaths,
+    interval_minutes: Option<u32>,
+    enabled: Option<bool>,
+) -> anyhow::Result<ScheduleSnapshot> {
+    let config_path = resolve_config_path(paths.config)?;
+    schedule::update_schedule_config(&config_path, interval_minutes, enabled)?;
+    let config = AppConfig::from_path(&config_path)
+        .with_context(|| format!("failed to reload config {}", config_path.display()))?;
+    if config.schedule.enabled {
         schedule::install_default_job(&config_path, config.schedule.interval_minutes)?;
     } else {
         schedule::uninstall_job()?;
     }
-    let config = AppConfig::from_path(&config_path)
-        .with_context(|| format!("failed to reload config {}", config_path.display()))?;
     Ok(ScheduleSnapshot {
         enabled: config.schedule.enabled,
         interval_minutes: config.schedule.interval_minutes,
@@ -537,7 +585,34 @@ fn write_credentials_to_path(
         .map(|(key, value)| format!("{key}={}", value.replace('\n', "")))
         .collect::<Vec<_>>();
     lines.sort();
-    fs::write(path, format!("{}\n", lines.join("\n")))
+    write_credentials_contents(path, &format!("{}\n", lines.join("\n")))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_credentials_contents(path: &PathBuf, contents: &str) -> anyhow::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to write credentials {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write credentials {}", path.display()))?;
+    let mut permissions = file
+        .metadata()
+        .with_context(|| format!("failed to inspect credentials {}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)
+        .with_context(|| format!("failed to secure credentials {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_credentials_contents(path: &PathBuf, contents: &str) -> anyhow::Result<()> {
+    fs::write(path, contents)
         .with_context(|| format!("failed to write credentials {}", path.display()))?;
     Ok(())
 }

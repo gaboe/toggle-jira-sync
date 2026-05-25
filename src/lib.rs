@@ -4,6 +4,7 @@ pub mod commands;
 pub mod config;
 pub mod db;
 pub mod jira;
+pub mod local_api;
 pub mod report;
 pub mod server;
 pub mod sync;
@@ -18,7 +19,7 @@ pub async fn run(cli: cli::Cli) -> anyhow::Result<()> {
         Some(cli::Command::Doctor(args)) => commands::doctor::run(args).await,
         Some(cli::Command::Status(args)) => commands::status::run(args).await,
         Some(cli::Command::Tui(args)) => commands::tui::run(args).await,
-        Some(cli::Command::Schedule(args)) => commands::schedule::run(args),
+        Some(cli::Command::Schedule(args)) => commands::schedule::run(args).await,
         Some(cli::Command::Server(args)) => server::run(args).await,
         None => {
             commands::tui::run(cli::TuiArgs {

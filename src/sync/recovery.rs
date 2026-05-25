@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::db::{Database, DbError, NewJiraWorklogLink, NewRecoveryFinding};
@@ -39,7 +39,7 @@ pub struct RecoveryReport {
     pub warnings: Vec<RecoveryWarning>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RecoveryConflict {
     DuplicateMarkedWorklogs {
@@ -51,7 +51,7 @@ pub enum RecoveryConflict {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RecoveryWarning {
     RequestedWindowClamped {

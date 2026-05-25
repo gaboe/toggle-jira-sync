@@ -117,6 +117,8 @@ The TUI shows recent local sync state from SQLite and lets you run common action
 - press `s` to run a real sync
 - press `a` to toggle the hourly OS scheduler
 
+Local day-to-day commands use the same backend HTTP server core as the GUI. `tjs`, `tjs tui`, `tjs status`, `tjs sync`, and `tjs schedule ...` start an embedded loopback server automatically for the command lifetime; you do not need to run `tjs server` separately for local use.
+
 It is the main day-to-day view:
 
 ```text
@@ -133,7 +135,7 @@ Issue URL: https://acme.atlassian.net/browse/PROJ-123
 Worklog URL: https://acme.atlassian.net/browse/PROJ-123?focusedWorklogId=26410
 ```
 
-While the TUI is open, it also runs an hourly in-process sync. The OS scheduler is separate and keeps hourly sync running when the TUI is not open.
+While the TUI is open, it also runs an hourly sync through the embedded local server. The OS scheduler is separate and keeps hourly sync running when the TUI is not open.
 
 Run a safe preview first:
 

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::db::{Database, DbError, NewJiraWorklogLink, NewSyncAttempt};
@@ -17,7 +18,7 @@ pub struct ExecutorOptions {
     pub crash_after_remote_create: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ExecutorReport {
     pub succeeded: usize,
     pub failed: usize,
@@ -25,7 +26,7 @@ pub struct ExecutorReport {
     pub conflicts: Vec<ExecutorConflict>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MutationStatus {
     Created,
     Updated,
@@ -36,7 +37,7 @@ pub enum MutationStatus {
     Error(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutorConflict {
     MoveDeleteFailed {
         toggl_workspace_id: String,

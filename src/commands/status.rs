@@ -1,7 +1,8 @@
-use crate::{app, cli::StatusArgs};
+use crate::{cli::StatusArgs, local_api::LocalServer};
 
 pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
-    let (_, _, report) = app::status_report(args.paths, args.limit)?;
+    let server = LocalServer::start(args.paths, None, args.limit).await?;
+    let report = server.client().status().await?;
 
     if args.json {
         println!("{}", report.to_json_string()?);
