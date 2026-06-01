@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.22
+
+- Make dashboard metrics follow the selected calendar month and default to the current month on app start.
+
 ## 0.1.21
 
 - Fix Windows desktop release builds by importing the cross-platform log writer trait.

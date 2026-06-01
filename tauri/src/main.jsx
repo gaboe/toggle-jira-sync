@@ -106,9 +106,25 @@ function monthKey(date) {
   return date.slice(0, 7);
 }
 
+function monthKeyFromDate(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  return `${year}-${month}`;
+}
+
 function monthLabel(key) {
   const [year, month] = key.split("-").map(Number);
   return new Intl.DateTimeFormat(undefined, { month: "long", year: "numeric" }).format(new Date(year, month - 1, 1));
+}
+
+function summarizeRows(rows) {
+  return rows.reduce((summary, row) => {
+    summary.total_count += 1;
+    if (row.status === "synced") summary.synced_count += 1;
+    if (row.status === "skipped") summary.skipped_count += 1;
+    if (row.status === "error") summary.error_count += 1;
+    return summary;
+  }, { total_count: 0, synced_count: 0, skipped_count: 0, error_count: 0 });
 }
 
 function configMonthToInput(value) {
@@ -342,20 +358,22 @@ function App() {
 
   const config = createMemo(() => snapshot()?.config);
   const schedule = createMemo(() => snapshot()?.schedule || { enabled: false, interval_minutes: 60 });
-  const summary = createMemo(() => snapshot()?.status.summary || { total_count: 0, synced_count: 0, skipped_count: 0, error_count: 0 });
+  const fallbackSummary = createMemo(() => snapshot()?.status.summary || { total_count: 0, synced_count: 0, skipped_count: 0, error_count: 0 });
   const rows = createMemo(() => (snapshot()?.status.entries || []).map((entry) => rowView(entry, config(), now())));
-  const months = createMemo(() => [...new Set(rows().map((row) => monthKey(row.date)).filter((key) => key !== "-"))]);
+  const currentMonth = createMemo(() => monthKeyFromDate(new Date(now())));
+  const months = createMemo(() => [...new Set([...rows().map((row) => monthKey(row.date)).filter((key) => key !== "-"), currentMonth()])].sort().reverse());
   const activeMonth = createMemo(() => {
     const selected = selectedMonth();
     if (selected && months().includes(selected)) return selected;
-    return months()[0] || null;
+    return currentMonth();
   });
+  const monthRows = createMemo(() => rows().filter((row) => monthKey(row.date) === activeMonth()));
+  const summary = createMemo(() => activeMonth() ? summarizeRows(monthRows()) : fallbackSummary());
   const visibleRows = createMemo(() => {
     const issueNeedle = issueFilter().trim().toLowerCase();
     const dateNeedle = dateFilter().trim().toLowerCase();
-    return rows()
+    return monthRows()
       .map((row, index) => ({ row, index }))
-      .filter(({ row }) => !activeMonth() || monthKey(row.date) === activeMonth())
       .filter(({ row }) => !issueNeedle || row.issue.toLowerCase().includes(issueNeedle))
       .filter(({ row }) => !dateNeedle || [row.date, row.time].join(" ").toLowerCase().includes(dateNeedle));
   });
@@ -367,8 +385,8 @@ function App() {
 
   createEffect(() => {
     const selected = selectedMonth();
-    if (selected && !months().includes(selected)) setSelectedMonth(months()[0] || null);
-    if (!selected && months().length > 0) setSelectedMonth(months()[0]);
+    if (selected && !months().includes(selected)) setSelectedMonth(currentMonth());
+    if (!selected) setSelectedMonth(currentMonth());
   });
 
   createEffect(() => {
