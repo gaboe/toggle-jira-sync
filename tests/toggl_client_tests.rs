@@ -213,7 +213,7 @@ async fn toggl_client_accepts_entries_without_updated_at() {
 }
 
 #[tokio::test]
-async fn toggl_client_initial_backfill_since_uses_configured_days() {
+async fn toggl_client_initial_backfill_since_defaults_to_current_month() {
     let config = AppConfig::from_toml_str(
         r#"
 [toggl]
@@ -248,15 +248,15 @@ enabled = true
 }
 
 #[tokio::test]
-async fn toggl_client_initial_backfill_starts_at_current_month_for_large_config_window() {
+async fn toggl_client_bounded_backfill_uses_bounded_config_window_across_months() {
     let config = TogglClientConfig {
         initial_backfill_days: 90,
         ..client_config("http://127.0.0.1:12345".to_owned())
     };
 
     assert_eq!(
-        config.initial_backfill_since(fixed_timestamp().unix_seconds),
-        1_714_521_600
+        config.bounded_backfill_since(fixed_timestamp().unix_seconds),
+        1_707_260_800
     );
 }
 
@@ -264,7 +264,7 @@ async fn toggl_client_initial_backfill_starts_at_current_month_for_large_config_
 async fn toggl_client_initial_backfill_fetch_uses_bounded_since() {
     let now = fixed_timestamp().unix_seconds;
     let server = TogglMockServer::start().await;
-    let expected_since = 1_714_521_600;
+    let expected_since = 1_707_260_800;
     let mock =
         server.mock_time_entries_since(toggl_auth("fake-toggl-token-do-not-log"), expected_since);
     let client =
@@ -283,7 +283,7 @@ async fn toggl_client_initial_backfill_fetch_uses_bounded_since() {
 async fn toggl_client_bounded_backfill_never_fetches_before_configured_window() {
     let now = fixed_timestamp().unix_seconds;
     let requested_since = now - 365 * 24 * 60 * 60;
-    let bounded_since = 1_714_521_600;
+    let bounded_since = 1_707_260_800;
     let server = TogglMockServer::start().await;
     let mock =
         server.mock_time_entries_since(toggl_auth("fake-toggl-token-do-not-log"), bounded_since);
@@ -343,6 +343,48 @@ async fn toggl_client_filters_entries_from_other_workspaces() {
     assert_eq!(result.entries.len(), 1);
     assert_eq!(result.entries[0].entry_id, "900010");
     assert!(result.skipped.is_empty());
+    mock.assert();
+}
+
+#[tokio::test]
+async fn toggl_client_maps_server_deleted_at_as_deleted() {
+    let since = fixed_timestamp().unix_seconds;
+    let server = httpmock::MockServer::start();
+    assert_local_mock_url(server.base_url());
+    let mock = server.mock(|when, then| {
+        when.method(Method::GET)
+            .path("/api/v9/me/time_entries")
+            .query_param("since", since.to_string().as_str());
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"[
+                    {
+                        "id": 900012,
+                        "workspace_id": 700001,
+                        "description": "SAB-100 deleted entry",
+                        "start": "2024-05-02T01:00:00Z",
+                        "duration": 1800,
+                        "updated_at": "2024-05-02T03:06:40Z",
+                        "server_deleted_at": "2024-05-02T03:06:40Z"
+                    }
+                ]"#,
+            );
+    });
+    let client =
+        TogglClient::new(client_config(server.base_url())).expect("client config is valid");
+
+    let result = client
+        .fetch_time_entries_since(since)
+        .await
+        .expect("server-deleted entry fetch should succeed");
+
+    assert_eq!(result.entries.len(), 1);
+    assert_eq!(result.entries[0].entry_id, "900012");
+    assert_eq!(
+        result.entries[0].deleted_at.as_deref(),
+        Some("2024-05-02T03:06:40Z")
+    );
     mock.assert();
 }
 

@@ -1,5 +1,6 @@
 use std::{thread, time::Duration};
 
+use rusqlite::Connection;
 use tempfile::NamedTempFile;
 use toggl_jira_sync::db::{
     Database, DbError, NewJiraIssueSiteCache, NewJiraWorklogLink, NewRecoveryFinding,
@@ -187,6 +188,34 @@ fn db_repository_apis_write_required_ledgers() {
 }
 
 #[test]
+fn db_finish_sync_run_marks_run_terminal() {
+    let (file, db) = temp_database();
+    db.run_migrations().expect("migrations should run");
+    let sync_run_id = db
+        .insert_sync_run(&NewSyncRun {
+            run_id: "run-finish",
+            mode: "sync",
+            status: "running",
+        })
+        .expect("sync run should insert");
+
+    db.finish_sync_run(sync_run_id, "error", Some("rate limited"))
+        .expect("sync run should finish");
+
+    let connection = Connection::open(file.path()).expect("sqlite db should open");
+    let (status, finished_at, error_message): (String, Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT status, finished_at, error_message FROM sync_runs WHERE id = ?1",
+            [sync_run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("sync run should be readable");
+    assert_eq!(status, "error");
+    assert!(finished_at.is_some());
+    assert_eq!(error_message.as_deref(), Some("rate limited"));
+}
+
+#[test]
 fn db_status_rows_derive_local_sync_state() {
     let (_file, db) = temp_database();
     db.run_migrations().expect("migrations should run");
@@ -199,31 +228,40 @@ fn db_status_rows_derive_local_sync_state() {
         })
         .expect("sync run should insert");
 
-    for (entry_id, issue_key, status, started_at) in [
+    for (entry_id, description, issue_key, status, started_at) in [
         (
             "entry-synced",
+            Some("SAB-101 work"),
             Some("SAB-101"),
             "created",
             "2024-05-02T01:00:00Z",
         ),
         (
             "entry-not-synced",
+            Some("SAB-102 work"),
             Some("SAB-102"),
             "planned",
             "2024-05-02T02:00:00Z",
         ),
         (
             "entry-error",
+            Some("SAB-103 work"),
             Some("SAB-103"),
             "error",
             "2024-05-02T03:00:00Z",
         ),
-        ("entry-skipped", None, "planned", "2024-05-02T04:00:00Z"),
+        (
+            "entry-skipped",
+            Some("admin work without a ticket"),
+            None,
+            "planned",
+            "2024-05-02T04:00:00Z",
+        ),
     ] {
         db.upsert_toggl_entry(&NewTogglEntry {
             toggl_workspace_id: "workspace-1",
             toggl_entry_id: entry_id,
-            description: issue_key.map(|key| format!("{key} work")).as_deref(),
+            description,
             extracted_issue_key: issue_key,
             source_hash: &format!("sha256:{entry_id}"),
             rounded_duration_seconds: 1800,
@@ -281,6 +319,44 @@ fn db_status_rows_derive_local_sync_state() {
 }
 
 #[test]
+fn blank_placeholder_entries_without_attempts_or_links_are_hidden_after_grace_period() {
+    let (_file, db) = temp_database();
+    db.run_migrations().expect("migrations should run");
+
+    db.upsert_toggl_entry(&NewTogglEntry {
+        toggl_workspace_id: "workspace-1",
+        toggl_entry_id: "blank-stale-entry",
+        description: None,
+        extracted_issue_key: None,
+        source_hash: "sha256:blank-stale",
+        rounded_duration_seconds: 7920,
+        status: "planned",
+        started_at: Some("2024-05-07T12:14:00Z"),
+        stopped_at: Some("2024-05-07T14:27:00Z"),
+    })
+    .expect("blank stale entry should insert");
+    db.upsert_toggl_entry(&NewTogglEntry {
+        toggl_workspace_id: "workspace-1",
+        toggl_entry_id: "described-skipped-entry",
+        description: Some("admin work without a ticket"),
+        extracted_issue_key: None,
+        source_hash: "sha256:described-skipped",
+        rounded_duration_seconds: 1800,
+        status: "planned",
+        started_at: Some("2024-05-08T12:14:00Z"),
+        stopped_at: Some("2024-05-08T12:44:00Z"),
+    })
+    .expect("described skipped entry should insert");
+
+    let rows = db.list_status_entries(10).expect("status rows should load");
+
+    assert!(!rows.iter().any(|row| row.entry == "blank-stale-entry"));
+    assert!(rows
+        .iter()
+        .any(|row| row.entry == "described-skipped-entry"));
+}
+
+#[test]
 fn deleted_toggl_entries_are_hidden_from_status_rows() {
     let (_file, db) = temp_database();
     db.run_migrations().expect("migrations should run");
@@ -322,6 +398,175 @@ fn deleted_toggl_entries_are_hidden_from_status_rows() {
     let rows = db.list_status_entries(10).expect("status rows should load");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].entry, "seen-entry");
+}
+
+#[test]
+fn retryable_error_entries_include_unsynced_historical_failures() {
+    let (_file, db) = temp_database();
+    db.run_migrations().expect("migrations should run");
+    let run_id = db
+        .insert_sync_run(&NewSyncRun {
+            run_id: "retry-run-1",
+            mode: "sync",
+            status: "completed",
+        })
+        .expect("sync run should insert");
+
+    for (entry_id, status, started_at) in [
+        ("retry-entry", "error", "2024-05-02T02:30:00Z"),
+        ("linked-entry", "error", "2024-05-02T03:30:00Z"),
+        ("deleted-entry", "error", "2024-05-02T04:30:00Z"),
+        ("planned-entry", "planned", "2024-05-02T05:30:00Z"),
+    ] {
+        db.upsert_toggl_entry(&NewTogglEntry {
+            toggl_workspace_id: "workspace-1",
+            toggl_entry_id: entry_id,
+            description: Some("CORE-269 implementation"),
+            extracted_issue_key: Some("CORE-269"),
+            source_hash: &format!("sha256:{entry_id}"),
+            rounded_duration_seconds: 1800,
+            status,
+            started_at: Some(started_at),
+            stopped_at: Some("2024-05-02T03:00:00Z"),
+        })
+        .expect("toggl entry should upsert");
+    }
+
+    db.insert_sync_attempt(&NewSyncAttempt {
+        sync_run_id: Some(run_id),
+        toggl_workspace_id: "workspace-1",
+        toggl_entry_id: "planned-entry",
+        jira_site_key: None,
+        jira_issue_key: Some("CORE-269"),
+        jira_worklog_id: None,
+        status: "error",
+        error_message: Some("old resolver error"),
+    })
+    .expect("error attempt should insert");
+    db.upsert_jira_worklog_link(&NewJiraWorklogLink {
+        toggl_workspace_id: "workspace-1",
+        toggl_entry_id: "linked-entry",
+        jira_site_key: "core",
+        jira_issue_key: "CORE-269",
+        jira_worklog_id: Some("10001"),
+        source_hash: "sha256:linked-entry",
+        rounded_duration_seconds: 1800,
+        status: "created",
+    })
+    .expect("linked entry should have active worklog");
+    db.mark_toggl_entry_deleted("workspace-1", "deleted-entry")
+        .expect("deleted entry should mark deleted");
+
+    let retryable = db
+        .list_retryable_error_toggl_entries("workspace-1")
+        .expect("retryable entries should load");
+    let ids = retryable
+        .iter()
+        .map(|entry| entry.entry.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec!["planned-entry", "retry-entry"]);
+    assert_eq!(
+        retryable[0].description.as_deref(),
+        Some("CORE-269 implementation")
+    );
+    assert_eq!(retryable[0].rounded_duration_seconds, 1800);
+    assert_eq!(retryable[0].started_at, "2024-05-02T05:30:00Z");
+    assert_eq!(
+        retryable[0].stopped_at.as_deref(),
+        Some("2024-05-02T03:00:00Z")
+    );
+}
+
+#[test]
+fn pending_local_entries_include_completed_planned_rows_without_active_links() {
+    let (_file, db) = temp_database();
+    db.run_migrations().expect("migrations should run");
+    let sync_run_id = db
+        .insert_sync_run(&NewSyncRun {
+            run_id: "pending-local-run",
+            mode: "dry_run",
+            status: "planned",
+        })
+        .expect("sync run should insert");
+
+    for (entry_id, issue_key, duration, status, stopped_at) in [
+        (
+            "pending-entry",
+            Some("CORE-297"),
+            9_660,
+            "planned",
+            Some("2024-05-02T07:11:00Z"),
+        ),
+        (
+            "latest-planned-entry",
+            Some("CORE-297"),
+            1_800,
+            "created",
+            Some("2024-05-02T08:30:00Z"),
+        ),
+        (
+            "no-issue-entry",
+            None,
+            1_800,
+            "planned",
+            Some("2024-05-02T09:30:00Z"),
+        ),
+        ("running-entry", Some("CORE-297"), 0, "planned", None),
+        (
+            "linked-entry",
+            Some("CORE-297"),
+            1_800,
+            "planned",
+            Some("2024-05-02T10:30:00Z"),
+        ),
+    ] {
+        db.upsert_toggl_entry(&NewTogglEntry {
+            toggl_workspace_id: "workspace-1",
+            toggl_entry_id: entry_id,
+            description: Some("CORE-297 implementation"),
+            extracted_issue_key: issue_key,
+            source_hash: "sha256:pending",
+            rounded_duration_seconds: duration,
+            status,
+            started_at: Some("2024-05-02T04:30:00Z"),
+            stopped_at,
+        })
+        .expect("toggl entry should upsert");
+    }
+
+    db.insert_sync_attempt(&NewSyncAttempt {
+        sync_run_id: Some(sync_run_id),
+        toggl_workspace_id: "workspace-1",
+        toggl_entry_id: "latest-planned-entry",
+        jira_site_key: None,
+        jira_issue_key: Some("CORE-297"),
+        jira_worklog_id: None,
+        status: "planned",
+        error_message: None,
+    })
+    .expect("planned attempt should insert");
+    db.upsert_jira_worklog_link(&NewJiraWorklogLink {
+        toggl_workspace_id: "workspace-1",
+        toggl_entry_id: "linked-entry",
+        jira_site_key: "sabservis",
+        jira_issue_key: "CORE-297",
+        jira_worklog_id: Some("10001"),
+        source_hash: "sha256:linked",
+        rounded_duration_seconds: 1_800,
+        status: "created",
+    })
+    .expect("active link should insert");
+
+    let pending = db
+        .list_pending_local_toggl_entries("workspace-1")
+        .expect("pending entries should load");
+    let ids = pending
+        .iter()
+        .map(|entry| entry.entry.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec!["latest-planned-entry", "pending-entry"]);
 }
 
 #[test]

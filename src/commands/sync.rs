@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::Duration,
+};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -10,19 +14,22 @@ use crate::{
         resolve_config_path, resolve_db_path, LocalCredentials,
     },
     config::{AppConfig, JiraSiteConfig},
-    db::{Database, NewSyncRun, NewTogglEntry, StoredJiraWorklogLink},
+    db::{
+        Database, NewSyncRun, NewTogglEntry, StoredJiraWorklogLink, StoredLinkedLocalTogglEntry,
+        StoredOpenTogglEntry, StoredPendingLocalTogglEntry, StoredRetryableTogglEntry,
+    },
     jira::{JiraClient, JiraWritePacing, JiraWritePacingScope, TokioSleeper},
     local_api::LocalServer,
     report::DryRunReport,
     sync::{
-        executor::{execute_plan, ExecutorOptions, ExecutorReport},
+        executor::{execute_plan, ExecutorFailurePolicy, ExecutorOptions, ExecutorReport},
         planner::{
             extract_issue_keys, plan_sync, ExistingWorklogLink, IssueSiteMapping, PlannedMutation,
             PlannerInput, PlannerOutcome, SyncPlan,
         },
         resolver::{IssueSiteResolutionError, IssueSiteResolver, ResolverSite},
     },
-    time::{format_unix_utc, parse_rfc3339_utc},
+    time::{format_unix_utc, initial_backfill_since, parse_rfc3339_utc, unique_run_id},
     toggl::{TogglClient, TogglClientConfig, TogglTimeEntry},
 };
 
@@ -158,71 +165,333 @@ async fn run_with_config(
         .run_migrations()
         .context("failed to run DB migrations")?;
     let mode = if args.dry_run { "dry_run" } else { "sync" };
+    let run_id = unique_run_id(mode);
     let lock = database
         .acquire_sync_lock(mode)
         .context("failed to acquire sync lock")?;
     let sync_run_id = database
         .insert_sync_run(&NewSyncRun {
-            run_id: &format!("{mode}-{}", current_unix_seconds()),
+            run_id: &run_id,
             mode,
             status: if args.dry_run { "planned" } else { "running" },
         })
         .context("failed to insert sync audit row")?;
 
-    let toggl_token = credentials.get_secret(&config.toggl.api_token_env)?;
-    let toggl_config =
-        TogglClientConfig::from_app_config(&config, toggl_token, config.toggl.base_url.clone())
-            .context("failed to build Toggl client config")?;
-    let since = toggl_config.initial_backfill_since(current_unix_seconds());
-    let toggl = TogglClient::new(toggl_config).context("failed to build Toggl client")?;
-    let fetch = toggl
-        .fetch_time_entries_since(since)
-        .await
-        .context("failed to fetch Toggl entries")?;
-    if args.cleanup_deleted && !args.dry_run {
-        cleanup_missing_toggl_entries(&database, config.toggl.workspace_id, since, &fetch)
-            .context("failed to cleanup deleted Toggl entries")?;
-    }
-    let issue_site_mappings =
-        resolve_issue_site_mappings(&config, &credentials, &database, &fetch.entries)
+    let sync_result: anyhow::Result<SyncCommandReport> = async {
+        let toggl_token = credentials.get_secret(&config.toggl.api_token_env)?;
+        let toggl_config =
+            TogglClientConfig::from_app_config(&config, toggl_token, config.toggl.base_url.clone())
+                .context("failed to build Toggl client config")?;
+        let now = current_unix_seconds();
+        let since = toggl_config.initial_backfill_since(now);
+        let toggl = TogglClient::new(toggl_config).context("failed to build Toggl client")?;
+        let fetch = toggl
+            .fetch_time_entries_since(since)
             .await
-            .context("failed to resolve Jira issue sites")?;
-    let existing_links = load_existing_links(&database).context("failed to load existing links")?;
+            .context("failed to fetch Toggl entries")?;
+        let prepared_fetch = fetch_entries_for_planning(&database, &toggl, &config, now, &fetch)
+            .await
+            .context("failed to prepare Toggl entries for planning")?;
+        if args.cleanup_deleted && !args.dry_run {
+            cleanup_missing_toggl_entries(&database, config.toggl.workspace_id, since, &fetch)
+                .context("failed to cleanup deleted Toggl entries")?;
+        }
+        let issue_site_mappings =
+            resolve_issue_site_mappings(&config, &credentials, &database, &prepared_fetch.entries)
+                .await
+                .context("failed to resolve Jira issue sites")?;
+        let existing_links =
+            load_existing_links(&database).context("failed to load existing links")?;
 
-    let plan = plan_sync(PlannerInput {
-        entries: fetch.entries.clone(),
-        issue_site_mappings: issue_site_mappings.clone(),
-        existing_links: existing_links.clone(),
-    })
-    .expect("planner does not fail globally");
-    record_toggl_entry_ledgers(&database, sync_run_id, &fetch.entries, &plan)
-        .context("failed to upsert Toggl entry ledger rows")?;
+        let plan = plan_sync(PlannerInput {
+            entries: prepared_fetch.entries.clone(),
+            issue_site_mappings: issue_site_mappings.clone(),
+            existing_links: existing_links.clone(),
+        })
+        .expect("planner does not fail globally");
+        record_toggl_entry_ledgers(&database, sync_run_id, &prepared_fetch.entries, &plan)
+            .context("failed to upsert Toggl entry ledger rows")?;
 
-    if args.dry_run {
-        let report = DryRunReport::from_fetch_result_with_resolved_sites(
-            fetch,
-            issue_site_mappings,
-            existing_links,
-        );
+        if args.dry_run {
+            let report = DryRunReport::from_fetch_result_with_resolved_sites(
+                crate::toggl::TogglFetchResult {
+                    entries: prepared_fetch.entries,
+                    skipped: prepared_fetch.skipped,
+                },
+                issue_site_mappings,
+                existing_links,
+            );
 
-        lock.release().context("failed to release sync lock")?;
+            return Ok(SyncCommandReport::DryRun { report });
+        }
 
-        return Ok(SyncCommandReport::DryRun { report });
+        let report =
+            execute_destructive_plan(&config, &credentials, &plan, &database, sync_run_id).await?;
+
+        Ok(SyncCommandReport::Sync {
+            succeeded: report.succeeded,
+            failed: report.failed,
+            statuses: report
+                .statuses
+                .iter()
+                .map(|status| format!("{status:?}"))
+                .collect(),
+        })
     }
+    .await;
 
-    let report = execute_destructive_plan(&config, &credentials, &plan, &database).await?;
+    match &sync_result {
+        Ok(SyncCommandReport::Sync { failed, .. }) if *failed > 0 => database
+            .finish_sync_run(
+                sync_run_id,
+                "error",
+                Some("one or more Jira mutations failed"),
+            )
+            .context("failed to finish sync audit row")?,
+        Ok(_) => database
+            .finish_sync_run(sync_run_id, "completed", None)
+            .context("failed to finish sync audit row")?,
+        Err(error) => database
+            .finish_sync_run(sync_run_id, "error", Some(&error.to_string()))
+            .context("failed to finish sync audit row")?,
+    }
 
     lock.release().context("failed to release sync lock")?;
 
-    Ok(SyncCommandReport::Sync {
-        succeeded: report.succeeded,
-        failed: report.failed,
-        statuses: report
-            .statuses
+    sync_result
+}
+
+fn entries_with_pending_local_entries(
+    database: &Database,
+    workspace_id: i64,
+    fetched_entries: &[TogglTimeEntry],
+) -> anyhow::Result<Vec<TogglTimeEntry>> {
+    let mut entries = fetched_entries.to_vec();
+    let mut seen_keys = fetched_entries
+        .iter()
+        .map(|entry| (entry.workspace_id.clone(), entry.entry_id.clone()))
+        .collect::<std::collections::HashSet<_>>();
+
+    for retryable in database.list_retryable_error_toggl_entries(&workspace_id.to_string())? {
+        if !seen_keys.insert((retryable.workspace.clone(), retryable.entry.clone())) {
+            continue;
+        }
+        entries.push(retryable_toggl_entry(retryable));
+    }
+
+    for pending in database.list_pending_local_toggl_entries(&workspace_id.to_string())? {
+        if !seen_keys.insert((pending.workspace.clone(), pending.entry.clone())) {
+            continue;
+        }
+        entries.push(pending_local_toggl_entry(pending));
+    }
+
+    Ok(entries)
+}
+
+struct PreparedTogglFetch {
+    entries: Vec<TogglTimeEntry>,
+    skipped: Vec<crate::toggl::TogglFetchSkip>,
+}
+
+async fn fetch_entries_for_planning(
+    database: &Database,
+    toggl: &TogglClient,
+    config: &AppConfig,
+    now: i64,
+    primary_fetch: &crate::toggl::TogglFetchResult,
+) -> anyhow::Result<PreparedTogglFetch> {
+    let workspace_id = config.toggl.workspace_id.to_string();
+    let ledger_is_empty = database.count_toggl_entries(&workspace_id)? == 0;
+    let mut entries = primary_fetch.entries.clone();
+    let mut skipped = primary_fetch.skipped.clone();
+
+    if ledger_is_empty && primary_fetch.entries.is_empty() {
+        wait_for_toggl_pacing(config).await;
+        let fallback = toggl
+            .fetch_time_entries_since(initial_backfill_since(
+                now,
+                config.runtime.initial_backfill_days,
+            ))
+            .await
+            .context("failed to fetch fallback Toggl backfill")?;
+        merge_fresh_toggl_entries(&mut entries, fallback.entries);
+        skipped.extend(fallback.skipped);
+    }
+
+    let open_entries = database.list_open_zero_duration_toggl_entries(&workspace_id)?;
+    if let Some(oldest_since) = oldest_missing_open_entry_since(&open_entries, &entries) {
+        wait_for_toggl_pacing(config).await;
+        let refresh = toggl
+            .fetch_time_entries_since(oldest_since)
+            .await
+            .context("failed to refresh open Toggl entries")?;
+        merge_fresh_toggl_entries(&mut entries, refresh.entries);
+        skipped.extend(refresh.skipped);
+    }
+
+    for entry_id in missing_open_entry_ids(&open_entries, &entries) {
+        wait_for_toggl_pacing(config).await;
+        let refresh = toggl
+            .fetch_time_entry_by_id(&entry_id)
+            .await
+            .with_context(|| format!("failed to refresh Toggl entry {entry_id}"))?;
+        merge_fresh_toggl_entries(&mut entries, refresh.entries);
+        skipped.extend(refresh.skipped);
+    }
+
+    let active_linked_entries = database.list_active_linked_local_toggl_entries_since(
+        &workspace_id,
+        &format_unix_utc(initial_backfill_since(
+            now,
+            config.runtime.initial_backfill_days,
+        )),
+    )?;
+    if let Some(oldest_since) = oldest_missing_linked_entry_since(&active_linked_entries, &entries)
+    {
+        wait_for_toggl_pacing(config).await;
+        let refresh = toggl
+            .fetch_time_entries_since(oldest_since)
+            .await
+            .context("failed to refresh linked Toggl entries")?;
+        let skipped_pacing = refresh
+            .skipped
             .iter()
-            .map(|status| format!("{status:?}"))
-            .collect(),
+            .any(|skip| skip.reason == crate::toggl::SkipReason::PacingWindow);
+        merge_fresh_toggl_entries(&mut entries, refresh.entries);
+        skipped.extend(refresh.skipped);
+        if !skipped_pacing {
+            let deleted_entries = missing_linked_entries(&active_linked_entries, &entries)
+                .into_iter()
+                .map(deleted_linked_toggl_entry)
+                .collect::<Vec<_>>();
+            merge_fresh_toggl_entries(&mut entries, deleted_entries);
+        }
+    }
+
+    Ok(PreparedTogglFetch {
+        entries: entries_with_pending_local_entries(database, config.toggl.workspace_id, &entries)?,
+        skipped,
     })
+}
+
+fn merge_fresh_toggl_entries(
+    entries: &mut Vec<TogglTimeEntry>,
+    fresh_entries: Vec<TogglTimeEntry>,
+) {
+    let fresh_keys = fresh_entries
+        .iter()
+        .map(|entry| (entry.workspace_id.clone(), entry.entry_id.clone()))
+        .collect::<HashSet<_>>();
+    entries.retain(|entry| {
+        !fresh_keys.contains(&(entry.workspace_id.clone(), entry.entry_id.clone()))
+    });
+    entries.extend(fresh_entries);
+}
+
+fn oldest_missing_open_entry_since(
+    open_entries: &[StoredOpenTogglEntry],
+    fetched_entries: &[TogglTimeEntry],
+) -> Option<i64> {
+    let fetched_keys = fetched_entries
+        .iter()
+        .map(|entry| (entry.workspace_id.as_str(), entry.entry_id.as_str()))
+        .collect::<HashSet<_>>();
+
+    open_entries
+        .iter()
+        .filter(|entry| !fetched_keys.contains(&(entry.workspace.as_str(), entry.entry.as_str())))
+        .filter_map(|entry| parse_rfc3339_utc(&entry.started_at))
+        .min()
+}
+
+fn missing_open_entry_ids(
+    open_entries: &[StoredOpenTogglEntry],
+    fetched_entries: &[TogglTimeEntry],
+) -> Vec<String> {
+    let fetched_keys = fetched_entries
+        .iter()
+        .map(|entry| (entry.workspace_id.as_str(), entry.entry_id.as_str()))
+        .collect::<HashSet<_>>();
+
+    open_entries
+        .iter()
+        .filter(|entry| !fetched_keys.contains(&(entry.workspace.as_str(), entry.entry.as_str())))
+        .map(|entry| entry.entry.clone())
+        .collect()
+}
+
+fn oldest_missing_linked_entry_since(
+    linked_entries: &[StoredLinkedLocalTogglEntry],
+    fetched_entries: &[TogglTimeEntry],
+) -> Option<i64> {
+    missing_linked_entries(linked_entries, fetched_entries)
+        .iter()
+        .filter_map(|entry| parse_rfc3339_utc(&entry.started_at))
+        .min()
+}
+
+fn missing_linked_entries(
+    linked_entries: &[StoredLinkedLocalTogglEntry],
+    fetched_entries: &[TogglTimeEntry],
+) -> Vec<StoredLinkedLocalTogglEntry> {
+    let fetched_keys = fetched_entries
+        .iter()
+        .map(|entry| (entry.workspace_id.as_str(), entry.entry_id.as_str()))
+        .collect::<HashSet<_>>();
+
+    linked_entries
+        .iter()
+        .filter(|entry| !fetched_keys.contains(&(entry.workspace.as_str(), entry.entry.as_str())))
+        .cloned()
+        .collect()
+}
+
+async fn wait_for_toggl_pacing(config: &AppConfig) {
+    tokio::time::sleep(Duration::from_secs_f64(
+        1.0 / config.rate_limits.toggl_max_rps,
+    ))
+    .await;
+}
+
+fn retryable_toggl_entry(entry: StoredRetryableTogglEntry) -> TogglTimeEntry {
+    TogglTimeEntry {
+        workspace_id: entry.workspace,
+        entry_id: entry.entry,
+        start: entry.started_at.clone(),
+        duration_seconds: entry.rounded_duration_seconds,
+        description: entry.description,
+        updated_at: entry.stopped_at.unwrap_or(entry.started_at),
+        deleted_at: None,
+        skip_reason: None,
+    }
+}
+
+fn pending_local_toggl_entry(entry: StoredPendingLocalTogglEntry) -> TogglTimeEntry {
+    TogglTimeEntry {
+        workspace_id: entry.workspace,
+        entry_id: entry.entry,
+        start: entry.started_at.clone(),
+        duration_seconds: entry.rounded_duration_seconds,
+        description: entry.description,
+        updated_at: entry.stopped_at.unwrap_or(entry.started_at),
+        deleted_at: None,
+        skip_reason: None,
+    }
+}
+
+fn deleted_linked_toggl_entry(entry: StoredLinkedLocalTogglEntry) -> TogglTimeEntry {
+    let stopped_at = entry.stopped_at.unwrap_or_else(|| entry.started_at.clone());
+    TogglTimeEntry {
+        workspace_id: entry.workspace,
+        entry_id: entry.entry,
+        start: entry.started_at.clone(),
+        duration_seconds: entry.rounded_duration_seconds,
+        description: entry.description,
+        updated_at: stopped_at.clone(),
+        deleted_at: Some(stopped_at),
+        skip_reason: None,
+    }
 }
 
 fn cleanup_missing_toggl_entries(
@@ -514,6 +783,7 @@ async fn execute_destructive_plan(
     credentials: &LocalCredentials,
     plan: &SyncPlan,
     database: &Database,
+    sync_run_id: i64,
 ) -> anyhow::Result<ExecutorReport> {
     let mut combined = ExecutorReport::default();
     let write_pacing_scope = JiraWritePacingScope::default();
@@ -523,9 +793,19 @@ async fn execute_destructive_plan(
             continue;
         }
         let client = jira_client_for_site(config, credentials, site, write_pacing_scope.clone())?;
-        let report = execute_plan(&site_plan, &client, database, ExecutorOptions::default())
-            .await
-            .with_context(|| format!("failed to execute Jira sync for site {}", site.key))?;
+        let report = execute_plan(
+            &site_plan,
+            &client,
+            database,
+            ExecutorOptions {
+                sync_run_id: Some(sync_run_id),
+                max_parallel_groups: config.rate_limits.jira_max_parallel_groups,
+                failure_policy: ExecutorFailurePolicy::ContinueIndependent,
+                ..ExecutorOptions::default()
+            },
+        )
+        .await
+        .with_context(|| format!("failed to execute Jira sync for site {}", site.key))?;
         combined.succeeded += report.succeeded;
         combined.failed += report.failed;
         combined.statuses.extend(report.statuses);
@@ -574,6 +854,7 @@ fn jira_client_for_site(
             same_issue_write_delay: Duration::from_millis(
                 config.rate_limits.jira_same_issue_write_delay_ms,
             ),
+            max_rate_limit_retries: config.rate_limits.jira_max_rate_limit_retries,
         },
         write_pacing_scope,
     ))
@@ -584,4 +865,421 @@ fn current_unix_seconds() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::{Method, MockServer};
+    use serde_json::json;
+
+    fn test_config(toggl_base_url: &str) -> AppConfig {
+        AppConfig::from_toml_str(&format!(
+            r#"
+[toggl]
+workspace_id = 700001
+api_token_env = "TOGGL_API_TOKEN"
+base_url = "{toggl_base_url}"
+
+[runtime]
+initial_backfill_days = 90
+
+[rate_limits]
+toggl_max_rps = 1000.0
+
+[jira]
+
+[[jira.sites]]
+key = "sabservis"
+base_url = "https://sabservis.atlassian.net"
+email_env = "SABSERVIS_JIRA_EMAIL"
+api_token_env = "SABSERVIS_JIRA_API_TOKEN"
+enabled = true
+"#
+        ))
+        .expect("test config should parse")
+    }
+
+    fn test_toggl(config: &AppConfig) -> TogglClient {
+        let toggl_config = TogglClientConfig::from_app_config(
+            config,
+            "fake-toggl-token-do-not-log".to_owned(),
+            config.toggl.base_url.clone(),
+        )
+        .expect("toggl config should build");
+        TogglClient::new(toggl_config).expect("toggl client should build")
+    }
+
+    #[tokio::test]
+    async fn first_run_fallback_fetches_bounded_window_after_empty_month() {
+        let database = Database::open(":memory:").expect("open in-memory db");
+        database.run_migrations().expect("run migrations");
+        let server = MockServer::start();
+        let config = test_config(&server.base_url());
+        let toggl = test_toggl(&config);
+        let now = 1_714_604_800;
+        let fallback_since = initial_backfill_since(now, config.runtime.initial_backfill_days);
+        let fallback = server.mock(|when, then| {
+            when.method(Method::GET)
+                .path("/api/v9/me/time_entries")
+                .query_param("since", fallback_since.to_string().as_str());
+            then.status(200).json_body(json!([
+                {
+                    "id": 900001,
+                    "workspace_id": 700001,
+                    "description": "SAB-123 fallback entry",
+                    "start": "2024-04-25T10:00:00Z",
+                    "duration": 1800,
+                    "updated_at": "2024-04-25T10:30:00Z"
+                }
+            ]));
+        });
+
+        let prepared = fetch_entries_for_planning(
+            &database,
+            &toggl,
+            &config,
+            now,
+            &crate::toggl::TogglFetchResult {
+                entries: Vec::new(),
+                skipped: Vec::new(),
+            },
+        )
+        .await
+        .expect("fallback fetch should prepare entries");
+
+        assert_eq!(prepared.entries.len(), 1);
+        assert_eq!(prepared.entries[0].entry_id, "900001");
+        fallback.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn first_run_does_not_fallback_when_month_fetch_has_entries() {
+        let database = Database::open(":memory:").expect("open in-memory db");
+        database.run_migrations().expect("run migrations");
+        let server = MockServer::start();
+        let config = test_config(&server.base_url());
+        let toggl = test_toggl(&config);
+        let unexpected_fetch = server.mock(|when, then| {
+            when.method(Method::GET).path("/api/v9/me/time_entries");
+            then.status(500).body("unexpected Toggl fetch");
+        });
+
+        let prepared = fetch_entries_for_planning(
+            &database,
+            &toggl,
+            &config,
+            1_714_604_800,
+            &crate::toggl::TogglFetchResult {
+                entries: vec![TogglTimeEntry {
+                    workspace_id: "700001".to_owned(),
+                    entry_id: "900001".to_owned(),
+                    start: "2024-05-01T10:00:00Z".to_owned(),
+                    duration_seconds: 1800,
+                    description: Some("SAB-123 current entry".to_owned()),
+                    updated_at: "2024-05-01T10:30:00Z".to_owned(),
+                    deleted_at: None,
+                    skip_reason: None,
+                }],
+                skipped: Vec::new(),
+            },
+        )
+        .await
+        .expect("primary entries should prepare without fallback");
+
+        assert_eq!(prepared.entries.len(), 1);
+        assert_eq!(unexpected_fetch.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn running_refresh_replaces_stale_open_entry() {
+        let database = Database::open(":memory:").expect("open in-memory db");
+        database.run_migrations().expect("run migrations");
+        database
+            .upsert_toggl_entry(&NewTogglEntry {
+                toggl_workspace_id: "700001",
+                toggl_entry_id: "900004",
+                description: Some("SAB-555 running entry"),
+                extracted_issue_key: Some("SAB-555"),
+                source_hash: "sha256:old",
+                rounded_duration_seconds: 0,
+                status: "planned",
+                started_at: Some("2026-05-30T10:00:00Z"),
+                stopped_at: None,
+            })
+            .expect("seed running entry");
+        let server = MockServer::start();
+        let config = test_config(&server.base_url());
+        let toggl = test_toggl(&config);
+        let refresh = server.mock(|when, then| {
+            when.method(Method::GET)
+                .path("/api/v9/me/time_entries")
+                .query_param("since", "1780135200");
+            then.status(200).json_body(json!([
+                {
+                    "id": 900004,
+                    "workspace_id": 700001,
+                    "description": "SAB-555 running entry",
+                    "start": "2026-05-30T10:00:00Z",
+                    "duration": 3600,
+                    "updated_at": "2026-05-30T11:00:00Z"
+                }
+            ]));
+        });
+
+        let prepared = fetch_entries_for_planning(
+            &database,
+            &toggl,
+            &config,
+            1_780_272_000,
+            &crate::toggl::TogglFetchResult {
+                entries: Vec::new(),
+                skipped: Vec::new(),
+            },
+        )
+        .await
+        .expect("running refresh should prepare entries");
+
+        assert_eq!(prepared.entries.len(), 1);
+        assert_eq!(prepared.entries[0].duration_seconds, 3600);
+        refresh.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn running_refresh_fetches_still_missing_entry_by_id() {
+        let database = Database::open(":memory:").expect("open in-memory db");
+        database.run_migrations().expect("run migrations");
+        database
+            .upsert_toggl_entry(&NewTogglEntry {
+                toggl_workspace_id: "700001",
+                toggl_entry_id: "900004",
+                description: Some("SAB-555 running entry"),
+                extracted_issue_key: Some("SAB-555"),
+                source_hash: "sha256:old",
+                rounded_duration_seconds: 0,
+                status: "planned",
+                started_at: Some("2026-05-30T10:00:00Z"),
+                stopped_at: None,
+            })
+            .expect("seed running entry");
+        let server = MockServer::start();
+        let config = test_config(&server.base_url());
+        let toggl = test_toggl(&config);
+        let range_refresh = server.mock(|when, then| {
+            when.method(Method::GET)
+                .path("/api/v9/me/time_entries")
+                .query_param("since", "1780135200");
+            then.status(200).json_body(json!([]));
+        });
+        let direct_refresh = server.mock(|when, then| {
+            when.method(Method::GET)
+                .path("/api/v9/me/time_entries/900004");
+            then.status(200).json_body(json!({
+                "id": 900004,
+                "workspace_id": 700001,
+                "description": "SAB-555 running entry",
+                "start": "2026-05-30T10:00:00Z",
+                "duration": 3600,
+                "updated_at": "2026-05-30T11:00:00Z"
+            }));
+        });
+
+        let prepared = fetch_entries_for_planning(
+            &database,
+            &toggl,
+            &config,
+            1_780_272_000,
+            &crate::toggl::TogglFetchResult {
+                entries: Vec::new(),
+                skipped: Vec::new(),
+            },
+        )
+        .await
+        .expect("direct running refresh should prepare entries");
+
+        assert_eq!(prepared.entries.len(), 1);
+        assert_eq!(prepared.entries[0].duration_seconds, 3600);
+        range_refresh.assert_hits(1);
+        direct_refresh.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn running_refresh_is_skipped_when_entry_is_already_fetched() {
+        let database = Database::open(":memory:").expect("open in-memory db");
+        database.run_migrations().expect("run migrations");
+        database
+            .upsert_toggl_entry(&NewTogglEntry {
+                toggl_workspace_id: "700001",
+                toggl_entry_id: "900004",
+                description: Some("SAB-555 running entry"),
+                extracted_issue_key: Some("SAB-555"),
+                source_hash: "sha256:old",
+                rounded_duration_seconds: 0,
+                status: "planned",
+                started_at: Some("2026-05-30T10:00:00Z"),
+                stopped_at: None,
+            })
+            .expect("seed running entry");
+        let server = MockServer::start();
+        let config = test_config(&server.base_url());
+        let toggl = test_toggl(&config);
+        let unexpected_fetch = server.mock(|when, then| {
+            when.method(Method::GET).path("/api/v9/me/time_entries");
+            then.status(500).body("unexpected Toggl fetch");
+        });
+
+        let prepared = fetch_entries_for_planning(
+            &database,
+            &toggl,
+            &config,
+            1_780_272_000,
+            &crate::toggl::TogglFetchResult {
+                entries: vec![TogglTimeEntry {
+                    workspace_id: "700001".to_owned(),
+                    entry_id: "900004".to_owned(),
+                    start: "2026-05-30T10:00:00Z".to_owned(),
+                    duration_seconds: 3600,
+                    description: Some("SAB-555 running entry".to_owned()),
+                    updated_at: "2026-05-30T11:00:00Z".to_owned(),
+                    deleted_at: None,
+                    skip_reason: None,
+                }],
+                skipped: Vec::new(),
+            },
+        )
+        .await
+        .expect("fetched running entry should prepare");
+
+        assert_eq!(prepared.entries.len(), 1);
+        assert_eq!(unexpected_fetch.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn linked_historical_refresh_fetches_missing_entries_by_range() {
+        let database = Database::open(":memory:").expect("open in-memory db");
+        database.run_migrations().expect("run migrations");
+        database
+            .upsert_toggl_entry(&NewTogglEntry {
+                toggl_workspace_id: "700001",
+                toggl_entry_id: "900100",
+                description: Some("SAB-123 old linked entry"),
+                extracted_issue_key: Some("SAB-123"),
+                source_hash: "sha256:old",
+                rounded_duration_seconds: 1800,
+                status: "planned",
+                started_at: Some("2026-05-12T10:00:00Z"),
+                stopped_at: Some("2026-05-12T10:30:00Z"),
+            })
+            .expect("seed linked entry");
+        database
+            .upsert_jira_worklog_link(&crate::db::NewJiraWorklogLink {
+                toggl_workspace_id: "700001",
+                toggl_entry_id: "900100",
+                jira_site_key: "sabservis",
+                jira_issue_key: "SAB-123",
+                jira_worklog_id: Some("10001"),
+                source_hash: "sha256:old",
+                rounded_duration_seconds: 1800,
+                status: "created",
+            })
+            .expect("seed active link");
+        let server = MockServer::start();
+        let config = test_config(&server.base_url());
+        let toggl = test_toggl(&config);
+        let range_refresh = server.mock(|when, then| {
+            when.method(Method::GET)
+                .path("/api/v9/me/time_entries")
+                .query_param("since", "1778580000");
+            then.status(200).json_body(json!([
+                {
+                    "id": 900100,
+                    "workspace_id": 700001,
+                    "description": "SAB-123 old linked entry",
+                    "start": "2026-05-12T10:00:00Z",
+                    "duration": 1740,
+                    "updated_at": "2026-06-01T10:00:00Z"
+                }
+            ]));
+        });
+
+        let prepared = fetch_entries_for_planning(
+            &database,
+            &toggl,
+            &config,
+            1_780_272_000,
+            &crate::toggl::TogglFetchResult {
+                entries: Vec::new(),
+                skipped: Vec::new(),
+            },
+        )
+        .await
+        .expect("linked refresh should prepare entries");
+
+        assert_eq!(prepared.entries.len(), 1);
+        assert_eq!(prepared.entries[0].entry_id, "900100");
+        assert_eq!(prepared.entries[0].duration_seconds, 1740);
+        assert_eq!(prepared.entries[0].deleted_at, None);
+        range_refresh.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn linked_historical_refresh_marks_entries_missing_from_range_deleted() {
+        let database = Database::open(":memory:").expect("open in-memory db");
+        database.run_migrations().expect("run migrations");
+        database
+            .upsert_toggl_entry(&NewTogglEntry {
+                toggl_workspace_id: "700001",
+                toggl_entry_id: "900101",
+                description: Some("SAB-123 deleted linked entry"),
+                extracted_issue_key: Some("SAB-123"),
+                source_hash: "sha256:old",
+                rounded_duration_seconds: 1800,
+                status: "planned",
+                started_at: Some("2026-05-12T10:00:00Z"),
+                stopped_at: Some("2026-05-12T10:30:00Z"),
+            })
+            .expect("seed linked entry");
+        database
+            .upsert_jira_worklog_link(&crate::db::NewJiraWorklogLink {
+                toggl_workspace_id: "700001",
+                toggl_entry_id: "900101",
+                jira_site_key: "sabservis",
+                jira_issue_key: "SAB-123",
+                jira_worklog_id: Some("10002"),
+                source_hash: "sha256:old",
+                rounded_duration_seconds: 1800,
+                status: "created",
+            })
+            .expect("seed active link");
+        let server = MockServer::start();
+        let config = test_config(&server.base_url());
+        let toggl = test_toggl(&config);
+        let range_refresh = server.mock(|when, then| {
+            when.method(Method::GET)
+                .path("/api/v9/me/time_entries")
+                .query_param("since", "1778580000");
+            then.status(200).json_body(json!([]));
+        });
+
+        let prepared = fetch_entries_for_planning(
+            &database,
+            &toggl,
+            &config,
+            1_780_272_000,
+            &crate::toggl::TogglFetchResult {
+                entries: Vec::new(),
+                skipped: Vec::new(),
+            },
+        )
+        .await
+        .expect("linked delete refresh should prepare entries");
+
+        assert_eq!(prepared.entries.len(), 1);
+        assert_eq!(prepared.entries[0].entry_id, "900101");
+        assert_eq!(
+            prepared.entries[0].deleted_at.as_deref(),
+            Some("2026-05-12T10:30:00Z")
+        );
+        range_refresh.assert_hits(1);
+    }
 }

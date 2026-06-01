@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.20
+
+- Add duplicate Jira worklog detection and explicit recovery repair for deterministic Toggl/Jira duplicates.
+- Add recovery UI controls and API support for repairing duplicate worklogs.
+- Fix Toggl deleted-entry handling by honoring `server_deleted_at` during cleanup.
+- Keep normal sync conservative while continuing to adopt matching external worklogs.
+
 ## 0.1.17
 
 - Add unsigned GitHub Release workflow for crates.io CLI publishing and Tauri desktop bundles.

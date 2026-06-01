@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::AppConfig,
-    time::{initial_backfill_since, month_start_since},
+    time::{current_month_start_since, initial_backfill_since, month_start_since},
 };
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -108,6 +108,10 @@ impl TogglClientConfig {
         {
             return month;
         }
+        current_month_start_since(now_unix_seconds)
+    }
+
+    pub fn bounded_backfill_since(&self, now_unix_seconds: i64) -> i64 {
         initial_backfill_since(now_unix_seconds, self.initial_backfill_days)
     }
 }
@@ -311,6 +315,50 @@ impl TogglClient {
         Ok(normalize_entries(raw_entries, self.workspace_id_raw))
     }
 
+    pub async fn fetch_time_entry_by_id(&self, entry_id: &str) -> TogglResult<TogglFetchResult> {
+        if self.should_skip_for_pacing()? {
+            return Ok(TogglFetchResult {
+                entries: Vec::new(),
+                skipped: vec![TogglFetchSkip {
+                    workspace_id: self.workspace_id.clone(),
+                    entry_id: Some(entry_id.to_owned()),
+                    reason: SkipReason::PacingWindow,
+                }],
+            });
+        }
+
+        let url = self
+            .base_url
+            .join(&format!("/api/v9/me/time_entries/{entry_id}"))
+            .map_err(|error| {
+                TogglError::InvalidConfig(format!("invalid Toggl time entry URL: {error}"))
+            })?;
+
+        let response = self
+            .http
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .basic_auth(&self.api_token, Some("api_token"))
+            .send()
+            .await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(TogglFetchResult {
+                entries: Vec::new(),
+                skipped: Vec::new(),
+            });
+        }
+
+        let raw_entry = response
+            .error_for_status_with_body()
+            .await?
+            .json::<RawTogglTimeEntry>()
+            .await?;
+
+        Ok(normalize_entries(vec![raw_entry], self.workspace_id_raw))
+    }
+
     fn initial_backfill_since(&self, now_unix_seconds: i64) -> i64 {
         initial_backfill_since(now_unix_seconds, self.initial_backfill_days)
     }
@@ -386,7 +434,10 @@ struct RawTogglTimeEntry {
     duration: i64,
     #[serde(default)]
     updated_at: Option<String>,
+    #[serde(default)]
     deleted_at: Option<String>,
+    #[serde(default)]
+    server_deleted_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,7 +475,7 @@ fn normalize_entries(
                 duration_seconds: raw.duration,
                 description: raw.description,
                 updated_at,
-                deleted_at: raw.deleted_at,
+                deleted_at: raw.deleted_at.or(raw.server_deleted_at),
                 skip_reason,
             }
         })

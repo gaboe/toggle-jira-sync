@@ -7,6 +7,8 @@ const DEFAULT_RECOVERY_SCAN_DAYS: u32 = 180;
 const DEFAULT_TOGGL_MAX_RPS: f64 = 1.0;
 const DEFAULT_JIRA_GLOBAL_WRITE_DELAY_MS: u64 = 150;
 const DEFAULT_JIRA_SAME_ISSUE_WRITE_DELAY_MS: u64 = 2_000;
+const DEFAULT_JIRA_MAX_RATE_LIMIT_RETRIES: usize = 8;
+const DEFAULT_JIRA_MAX_PARALLEL_GROUPS: usize = 4;
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -85,6 +87,10 @@ pub struct RateLimitConfig {
     pub jira_global_write_delay_ms: u64,
     #[serde(default = "default_jira_same_issue_write_delay_ms")]
     pub jira_same_issue_write_delay_ms: u64,
+    #[serde(default = "default_jira_max_rate_limit_retries")]
+    pub jira_max_rate_limit_retries: usize,
+    #[serde(default = "default_jira_max_parallel_groups")]
+    pub jira_max_parallel_groups: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -111,6 +117,8 @@ impl Default for RateLimitConfig {
             toggl_max_rps: DEFAULT_TOGGL_MAX_RPS,
             jira_global_write_delay_ms: DEFAULT_JIRA_GLOBAL_WRITE_DELAY_MS,
             jira_same_issue_write_delay_ms: DEFAULT_JIRA_SAME_ISSUE_WRITE_DELAY_MS,
+            jira_max_rate_limit_retries: DEFAULT_JIRA_MAX_RATE_LIMIT_RETRIES,
+            jira_max_parallel_groups: DEFAULT_JIRA_MAX_PARALLEL_GROUPS,
         }
     }
 }
@@ -202,6 +210,15 @@ impl AppConfig {
 
         if self.rate_limits.toggl_max_rps <= 0.0 {
             errors.push("rate_limits.toggl_max_rps must be greater than 0".to_owned());
+        }
+
+        if self.rate_limits.jira_max_rate_limit_retries == 0 {
+            errors
+                .push("rate_limits.jira_max_rate_limit_retries must be greater than 0".to_owned());
+        }
+
+        if self.rate_limits.jira_max_parallel_groups == 0 {
+            errors.push("rate_limits.jira_max_parallel_groups must be greater than 0".to_owned());
         }
 
         if self.schedule.interval_minutes == 0 {
@@ -336,6 +353,14 @@ fn default_jira_global_write_delay_ms() -> u64 {
 
 fn default_jira_same_issue_write_delay_ms() -> u64 {
     DEFAULT_JIRA_SAME_ISSUE_WRITE_DELAY_MS
+}
+
+fn default_jira_max_rate_limit_retries() -> usize {
+    DEFAULT_JIRA_MAX_RATE_LIMIT_RETRIES
+}
+
+fn default_jira_max_parallel_groups() -> usize {
+    DEFAULT_JIRA_MAX_PARALLEL_GROUPS
 }
 
 fn default_schedule_enabled() -> bool {

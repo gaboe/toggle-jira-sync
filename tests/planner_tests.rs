@@ -230,15 +230,20 @@ fn planner_multiple_issue_keys_uses_only_resolved_key() {
 }
 
 #[test]
-fn planner_unresolved_or_ambiguous_issue_site_reports_error_without_mutation() {
+fn planner_unresolved_issue_site_skips_without_mutation() {
     let unknown = plan_sync(input(vec![entry("900001", "Unknown ABC-123")]))
         .expect("planner should not fail globally");
     assert!(unknown.mutations.is_empty());
-    assert!(matches!(
+    assert_eq!(
         unknown.entries[0].outcome,
-        PlannerOutcome::Error(PlannerIssue::UnresolvedIssueSite { .. })
-    ));
+        PlannerOutcome::Skip(SkipCause::UnresolvedIssueSite {
+            issue_key: "ABC-123".to_owned()
+        })
+    );
+}
 
+#[test]
+fn planner_ambiguous_issue_site_reports_error_without_mutation() {
     let mut ambiguous_input = input(vec![entry("900002", "Ambiguous SAB-123")]);
     ambiguous_input.issue_site_mappings.push(IssueSiteMapping {
         issue_key: "SAB-123".to_owned(),

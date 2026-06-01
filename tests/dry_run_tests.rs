@@ -8,7 +8,10 @@ use regex::Regex;
 use serde_json::Value;
 use support::{fixture_text, temp_db, toggl_auth, FixtureName};
 use toggl_jira_sync::{
-    db::{Database, NewJiraIssueSiteCache, NewJiraWorklogLink},
+    db::{
+        Database, NewJiraIssueSiteCache, NewJiraWorklogLink, NewSyncAttempt, NewSyncRun,
+        NewTogglEntry,
+    },
     report::{DryRunReport, PlannedAction},
     sync::planner::IssueSiteMapping,
     toggl::{SkipReason, TogglFetchResult, TogglTimeEntry},
@@ -241,6 +244,38 @@ fn dry_run_reports_multiple_issue_keys_as_error_without_mutation_action() {
 }
 
 #[test]
+fn dry_run_reports_unresolved_issue_site_as_skip_without_mutation_action() {
+    let report = DryRunReport::from_fetch_result_with_resolved_sites(
+        TogglFetchResult {
+            entries: vec![TogglTimeEntry {
+                workspace_id: "700001".to_owned(),
+                entry_id: "900010".to_owned(),
+                start: "2024-05-02T01:00:00Z".to_owned(),
+                duration_seconds: 1800,
+                description: Some("BLT-121 belongs elsewhere".to_owned()),
+                updated_at: "2024-05-02T03:06:40Z".to_owned(),
+                deleted_at: None,
+                skip_reason: None,
+            }],
+            skipped: Vec::new(),
+        },
+        vec![IssueSiteMapping {
+            issue_key: "SAB-123".to_owned(),
+            jira_site_key: "sabservis".to_owned(),
+        }],
+        Vec::new(),
+    );
+
+    assert_eq!(report.summary.skipped_count, 1);
+    assert_eq!(report.summary.errors_count, 0);
+    assert_eq!(report.entries[0].action, PlannedAction::Skipped);
+    assert_eq!(
+        report.entries[0].reason.as_deref(),
+        Some("Jira issue BLT-121 was not found on any enabled Jira site")
+    );
+}
+
+#[test]
 fn dry_run_never_calls_jira_mutation_endpoints() {
     let toggl = MockServer::start();
     let sab_jira = MockServer::start();
@@ -435,6 +470,188 @@ fn dry_run_uses_issue_site_cache_without_discovery_gets() {
     );
     assert_eq!(sab_discovery.hits(), 0);
     assert_eq!(blogic_discovery.hits(), 0);
+}
+
+#[test]
+fn dry_run_retries_historical_error_entries_not_returned_by_toggl_fetch() {
+    let toggl = MockServer::start();
+    let sab_jira = MockServer::start();
+    let blogic_jira = MockServer::start();
+    let db = temp_db();
+    let config = tempfile::NamedTempFile::new().expect("config file");
+    write_config(
+        config.path(),
+        &toggl.base_url(),
+        &sab_jira.base_url(),
+        &blogic_jira.base_url(),
+    );
+
+    toggl.mock(|when, then| {
+        when.method(Method::GET)
+            .path("/api/v9/me/time_entries")
+            .header(
+                "authorization",
+                toggl_auth("fake-toggl-token-do-not-log").header_value(),
+            );
+        then.status(200)
+            .header("content-type", "application/json")
+            .body("[]");
+    });
+    sab_jira.mock(|when, then| {
+        when.method(Method::GET).path("/rest/api/3/issue/SAB-123");
+        then.status(200)
+            .json_body(serde_json::json!({ "key": "SAB-123" }));
+    });
+    blogic_jira.mock(|when, then| {
+        when.method(Method::GET).path("/rest/api/3/issue/SAB-123");
+        then.status(404).json_body(serde_json::json!({}));
+    });
+
+    let database = Database::open(db.path()).expect("open sqlite db");
+    database.run_migrations().expect("migrations should run");
+    let sync_run_id = database
+        .insert_sync_run(&NewSyncRun {
+            run_id: "historical-error-run",
+            mode: "sync",
+            status: "completed",
+        })
+        .expect("seed sync run");
+    database
+        .upsert_toggl_entry(&NewTogglEntry {
+            toggl_workspace_id: "700001",
+            toggl_entry_id: "old-error-entry",
+            description: Some("SAB-123 fixed description"),
+            extracted_issue_key: Some("SAB-123"),
+            source_hash: "sha256:old-error-entry",
+            rounded_duration_seconds: 1800,
+            status: "error",
+            started_at: Some("2024-05-02T01:00:00Z"),
+            stopped_at: Some("2024-05-02T01:30:00Z"),
+        })
+        .expect("seed old error entry");
+    database
+        .insert_sync_attempt(&NewSyncAttempt {
+            sync_run_id: Some(sync_run_id),
+            toggl_workspace_id: "700001",
+            toggl_entry_id: "old-error-entry",
+            jira_site_key: None,
+            jira_issue_key: Some("SAB-123"),
+            jira_worklog_id: None,
+            status: "error",
+            error_message: Some("old resolver error"),
+        })
+        .expect("seed old error attempt");
+
+    let output = Command::new(binary())
+        .args([
+            "sync",
+            "--dry-run",
+            "--config",
+            config.path().to_str().expect("config path UTF-8"),
+            "--db",
+            db.path().to_str().expect("db path UTF-8"),
+            "--json",
+        ])
+        .env("TOGGL_API_TOKEN", "fake-toggl-token-do-not-log")
+        .env("SABSERVIS_JIRA_EMAIL", "sync@example.test")
+        .env("SABSERVIS_JIRA_API_TOKEN", "fake-jira-token-do-not-log")
+        .env("BLOGIC_JIRA_EMAIL", "sync@example.test")
+        .env("BLOGIC_JIRA_API_TOKEN", "fake-jira-token-do-not-log")
+        .output()
+        .expect("run dry-run command");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(parsed["summary"]["create_count"], 1);
+    assert_eq!(parsed["entries"][0]["toggl_entry_id"], "old-error-entry");
+    assert_eq!(parsed["entries"][0]["action"], "create");
+}
+
+#[test]
+fn dry_run_plans_completed_local_entries_not_returned_by_toggl_fetch() {
+    let toggl = MockServer::start();
+    let sab_jira = MockServer::start();
+    let blogic_jira = MockServer::start();
+    let db = temp_db();
+    let config = tempfile::NamedTempFile::new().expect("config file");
+    write_config(
+        config.path(),
+        &toggl.base_url(),
+        &sab_jira.base_url(),
+        &blogic_jira.base_url(),
+    );
+
+    toggl.mock(|when, then| {
+        when.method(Method::GET)
+            .path("/api/v9/me/time_entries")
+            .header(
+                "authorization",
+                toggl_auth("fake-toggl-token-do-not-log").header_value(),
+            );
+        then.status(200)
+            .header("content-type", "application/json")
+            .body("[]");
+    });
+    sab_jira.mock(|when, then| {
+        when.method(Method::GET).path("/rest/api/3/issue/SAB-123");
+        then.status(200)
+            .json_body(serde_json::json!({ "key": "SAB-123" }));
+    });
+    blogic_jira.mock(|when, then| {
+        when.method(Method::GET).path("/rest/api/3/issue/SAB-123");
+        then.status(404).json_body(serde_json::json!({}));
+    });
+
+    let database = Database::open(db.path()).expect("open sqlite db");
+    database.run_migrations().expect("migrations should run");
+    database
+        .upsert_toggl_entry(&NewTogglEntry {
+            toggl_workspace_id: "700001",
+            toggl_entry_id: "local-planned-entry",
+            description: Some("SAB-123 local planned entry"),
+            extracted_issue_key: Some("SAB-123"),
+            source_hash: "sha256:local-planned-entry",
+            rounded_duration_seconds: 1_800,
+            status: "planned",
+            started_at: Some("2024-05-02T01:00:00Z"),
+            stopped_at: Some("2024-05-02T01:30:00Z"),
+        })
+        .expect("seed local planned entry");
+
+    let output = Command::new(binary())
+        .args([
+            "sync",
+            "--dry-run",
+            "--config",
+            config.path().to_str().expect("config path UTF-8"),
+            "--db",
+            db.path().to_str().expect("db path UTF-8"),
+            "--json",
+        ])
+        .env("TOGGL_API_TOKEN", "fake-toggl-token-do-not-log")
+        .env("SABSERVIS_JIRA_EMAIL", "sync@example.test")
+        .env("SABSERVIS_JIRA_API_TOKEN", "fake-jira-token-do-not-log")
+        .env("BLOGIC_JIRA_EMAIL", "sync@example.test")
+        .env("BLOGIC_JIRA_API_TOKEN", "fake-jira-token-do-not-log")
+        .output()
+        .expect("run dry-run command");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(parsed["summary"]["create_count"], 1);
+    assert_eq!(
+        parsed["entries"][0]["toggl_entry_id"],
+        "local-planned-entry"
+    );
+    assert_eq!(parsed["entries"][0]["action"], "create");
 }
 
 #[test]

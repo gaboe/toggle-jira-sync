@@ -6,15 +6,37 @@ import "./styles.css";
 
 const backgroundSyncIntervalMs = 60 * 60 * 1000;
 const minimumBusyMs = 650;
-const desktopApiBaseUrl = window.__TJS_API_BASE_URL__ || "";
 const webApiBaseUrl = import.meta.env.VITE_TJS_API_BASE_URL || "";
-const apiBaseUrl = (desktopApiBaseUrl || webApiBaseUrl).replace(/\/$/, "");
 const tenantId = import.meta.env.VITE_TJS_TENANT_ID || "";
 const tenantToken = import.meta.env.VITE_TJS_TENANT_TOKEN || "";
 const tenantApiPrefix = tenantId ? `/api/tenants/${encodeURIComponent(tenantId)}` : "/api";
 const isTenantMode = Boolean(tenantId);
+const syncActivityStorageKey = "tjs:last-sync-activity";
+
+function currentApiBaseUrl() {
+  return (window.__TJS_API_BASE_URL__ || webApiBaseUrl).replace(/\/$/, "");
+}
+
+function loadStoredSyncActivity() {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(syncActivityStorageKey) || "null");
+    return parsed && ["success", "error"].includes(parsed.status) ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function storeSyncActivity(activity) {
+  if (!["success", "error"].includes(activity.status)) return;
+  try {
+    window.localStorage.setItem(syncActivityStorageKey, JSON.stringify(activity));
+  } catch (_) {
+    return;
+  }
+}
 
 async function apiRequest(path, options = {}) {
+  const apiBaseUrl = currentApiBaseUrl();
   if (!apiBaseUrl) {
     return tauriInvoke(options.tauriCommand, options.tauriArgs || {});
   }
@@ -22,6 +44,7 @@ async function apiRequest(path, options = {}) {
     method: options.method || "GET",
     headers: {
       ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(window.__TJS_DESKTOP_SECRETS__ ? { "X-TJS-Desktop-Secrets": "1" } : {}),
       ...(tenantToken ? { Authorization: `Bearer ${tenantToken}` } : {}),
     },
     body: options.body ? JSON.stringify(options.body) : undefined,
@@ -36,7 +59,11 @@ const api = {
   configSnapshot: () => apiRequest(`${tenantApiPrefix}/config`, { tauriCommand: "config_snapshot" }),
   dryRun: () => apiRequest(`${tenantApiPrefix}/sync/dry-run`, { method: "POST", tauriCommand: "dry_run" }),
   sync: () => apiRequest(`${tenantApiPrefix}/sync`, { method: "POST", tauriCommand: "sync" }),
+  recoverCommand: (repairDuplicates) => apiRequest("/api/recover/command", { method: "POST", body: { repair_duplicates: repairDuplicates }, tauriCommand: "recover_command", tauriArgs: { repairDuplicates, repair_duplicates: repairDuplicates } }),
   saveConfig: (update) => apiRequest("/api/config", { method: "PUT", body: update, tauriCommand: "save_config", tauriArgs: { update } }),
+  testTogglCredentials: (request) => apiRequest("/api/config/test-toggl", { method: "POST", body: request, tauriCommand: "test_toggl_credentials", tauriArgs: { request } }),
+  testJiraCredentials: (request) => apiRequest("/api/config/test-jira", { method: "POST", body: request, tauriCommand: "test_jira_credentials", tauriArgs: { request } }),
+  logFile: () => apiRequest("/api/log-file", { tauriCommand: "log_file" }),
   deleteLocalData: () => apiRequest("/api/local-data", { method: "DELETE", tauriCommand: "delete_local_data" }),
   exportConfig: () => apiRequest("/api/config/export", { method: "POST", tauriCommand: "export_config" }),
 };
@@ -303,11 +330,14 @@ function App() {
   const [dateFilter, setDateFilter] = createSignal("");
   const [loadError, setLoadError] = createSignal("");
   const [busyCommand, setBusyCommand] = createSignal(null);
-  const [activity, setActivity] = createSignal(null);
+  const [activity, setActivity] = createSignal(loadStoredSyncActivity());
   const [now, setNow] = createSignal(Date.now());
   const [guiBackgroundSyncEnabled, setGuiBackgroundSyncEnabled] = createSignal(true);
   const [nextBackgroundSyncAt, setNextBackgroundSyncAt] = createSignal(null);
   const [selectedMonth, setSelectedMonth] = createSignal(null);
+  const [credentialChecks, setCredentialChecks] = createSignal({});
+  const [logPath, setLogPath] = createSignal("");
+  const [recoveryReport, setRecoveryReport] = createSignal(null);
   let backgroundTimer;
 
   const config = createMemo(() => snapshot()?.config);
@@ -359,6 +389,7 @@ function App() {
 
   onMount(() => {
     refresh();
+    api.logFile().then((result) => setLogPath(result.path)).catch(() => setLogPath(""));
     const interval = setInterval(() => setNow(Date.now()), 1_000);
     onCleanup(() => {
       clearInterval(interval);
@@ -397,7 +428,7 @@ function App() {
       await waitForMinimumBusy(startedAt);
       toast.dismiss(loadingToast);
       toast.success(copy.toastSuccess);
-      setActivity({
+      const nextActivity = {
         status: "success",
         command,
         title: copy.successTitle,
@@ -405,12 +436,15 @@ function App() {
         detail: copy.successMessage,
         startedAt: startedOn,
         finishedAt: Date.now(),
-      });
+      };
+      setActivity(nextActivity);
+      storeSyncActivity(nextActivity);
     } catch (error) {
       toast.dismiss(loadingToast);
       const message = String(error);
+      await api.logFile().catch(() => null);
       toast.error(`${copy.toastError}: ${message}`);
-      setActivity({
+      const nextActivity = {
         status: "error",
         command,
         title: copy.errorTitle,
@@ -418,7 +452,29 @@ function App() {
         detail: copy.runningMessage,
         startedAt: startedOn,
         finishedAt: Date.now(),
-      });
+      };
+      setActivity(nextActivity);
+      storeSyncActivity(nextActivity);
+    } finally {
+      setBusyCommand(null);
+    }
+  }
+
+  async function runRecovery(repairDuplicates = false) {
+    if (busyCommand()) return;
+    if (repairDuplicates && !window.confirm("Repair deterministic duplicate Jira worklogs? This can delete tool-owned duplicate worklogs after the original is adopted.")) return;
+    const command = repairDuplicates ? "recover_repair" : "recover";
+    const loadingToast = toast.loading(repairDuplicates ? "Repairing duplicate worklogs..." : "Checking recovery state...");
+    setBusyCommand(command);
+    try {
+      const report = await api.recoverCommand(repairDuplicates);
+      setRecoveryReport(report);
+      await refresh();
+      toast.dismiss(loadingToast);
+      toast.success(repairDuplicates ? `Recovery repair complete: ${report.duplicate_repairs_applied} repaired.` : `Recovery check complete: ${report.duplicate_worklogs.length} duplicate group(s).`);
+    } catch (error) {
+      toast.dismiss(loadingToast);
+      toast.error(`Recovery failed: ${String(error)}`);
     } finally {
       setBusyCommand(null);
     }
@@ -506,6 +562,61 @@ function App() {
     }
   }
 
+  async function openLogFile() {
+    try {
+      const result = await api.logFile();
+      setLogPath(result.path);
+      await openUrl(result.path);
+    } catch (error) {
+      toast.error(`Could not open logs: ${String(error)}`);
+    }
+  }
+
+  function setCredentialCheck(key, status, message) {
+    setCredentialChecks((current) => ({ ...current, [key]: { status, message } }));
+  }
+
+  async function testTogglCredentials(form) {
+    const token = form.toggl_api_token_value.value.trim();
+    if (!token) {
+      setCredentialCheck("toggl", "error", "Paste the Toggl API token first.");
+      return;
+    }
+    setCredentialCheck("toggl", "running", "Testing Toggl credentials…");
+    try {
+      const result = await api.testTogglCredentials({ base_url: null, api_token: token });
+      setCredentialCheck("toggl", result.ok ? "success" : "error", result.message);
+    } catch (error) {
+      setCredentialCheck("toggl", "error", String(error));
+    }
+  }
+
+  async function testJiraCredentials(siteCard, index, site) {
+    const key = `jira-${index}`;
+    const value = (name) => siteCard.querySelector(`[name="${name}"]`)?.value.trim() || "";
+    const request = {
+      base_url: value("jira_base_url") || site?.base_url || "",
+      email: value("jira_email_value") || site?.email_value || "",
+      api_token: value("jira_api_token_value") || site?.api_token_value || "",
+    };
+    if (!request.base_url || !request.email || !request.api_token) {
+      const missing = [
+        !request.base_url ? "Base URL" : null,
+        !request.email ? "email" : null,
+        !request.api_token ? "API token" : null,
+      ].filter(Boolean).join(", ");
+      setCredentialCheck(key, "error", `Fill ${missing} first.`);
+      return;
+    }
+    setCredentialCheck(key, "running", "Testing Jira credentials…");
+    try {
+      const result = await api.testJiraCredentials(request);
+      setCredentialCheck(key, result.ok ? "success" : "error", result.message);
+    } catch (error) {
+      setCredentialCheck(key, "error", String(error));
+    }
+  }
+
   async function openUrl(url) {
     if (!url) return;
     await tauriInvoke("open_url", { url }).catch((error) => toast.error(String(error)));
@@ -542,6 +653,9 @@ function App() {
                 activeMonth={activeMonth()}
                 setSelectedMonth={setSelectedMonth}
                 activity={activity()}
+                recoveryReport={recoveryReport()}
+                runRecovery={runRecovery}
+                busyCommand={busyCommand()}
                 now={now()}
                 setView={setView}
                 readOnlyConfig={isTenantMode}
@@ -550,8 +664,8 @@ function App() {
           </Match>
           <Match when={view() === "configuration"}>
             <section class="view-surface">
-              <Show when={config()} fallback={<div class="panel empty-detail">{loadError() || "Loading configuration…"}</div>}>
-                <Configuration config={config()} guiBackgroundSyncEnabled={guiBackgroundSyncEnabled()} saveConfig={saveConfig} deleteLocalData={deleteLocalData} exportConfig={exportConfig} readOnly={isTenantMode} />
+              <Show when={config()} keyed fallback={<div class="panel empty-detail">{loadError() || "Loading configuration…"}</div>}>
+                {(currentConfig) => <Configuration config={currentConfig} guiBackgroundSyncEnabled={guiBackgroundSyncEnabled()} saveConfig={saveConfig} testTogglCredentials={testTogglCredentials} testJiraCredentials={testJiraCredentials} credentialChecks={credentialChecks()} logPath={logPath()} deleteLocalData={deleteLocalData} exportConfig={exportConfig} openLogFile={openLogFile} readOnly={isTenantMode} />}
               </Show>
             </section>
           </Match>
@@ -630,6 +744,7 @@ function Overview(props) {
     <>
       <SummaryMetrics summary={props.summary} />
       <Show when={props.activity}><SyncActivity activity={props.activity} now={props.now} /></Show>
+      <RecoveryPanel report={props.recoveryReport} runRecovery={props.runRecovery} busyCommand={props.busyCommand} />
       <Show when={configPrompt()}>
         {(prompt) => (
           <section class="panel overview-prompt">
@@ -662,6 +777,44 @@ function Overview(props) {
         <IssuePanel row={props.selectedRow} openUrl={props.openUrl} setView={props.setView} readOnlyConfig={props.readOnlyConfig} />
       </div>
     </>
+  );
+}
+
+function RecoveryPanel(props) {
+  const duplicateCount = () => props.report?.duplicate_worklogs?.length || 0;
+  const repairedCount = () => props.report?.duplicate_repairs_applied || 0;
+  const checking = () => props.busyCommand === "recover";
+  const repairing = () => props.busyCommand === "recover_repair";
+  const hasDuplicates = () => duplicateCount() > 0;
+  return (
+    <section class="panel recovery-panel">
+      <div class="recovery-copy">
+        <p class="panel-kicker">Recovery</p>
+        <h2>Duplicate worklog check</h2>
+        <p>
+          <Show when={props.report} fallback="Scan Jira for duplicate worklogs that match Toggl entries before running a repair.">
+            <Show when={hasDuplicates()} fallback={`No duplicate worklog groups found. ${repairedCount()} repair(s) applied in the last run.`}>
+              {duplicateCount()} duplicate group(s) found. Review the list, then repair only deterministic tool-owned duplicates.
+            </Show>
+          </Show>
+        </p>
+      </div>
+      <Show when={hasDuplicates()}>
+        <ul class="duplicate-list" aria-label="Duplicate worklog groups">
+          <For each={props.report.duplicate_worklogs}>{(group) => (
+            <li>
+              <strong>{group.jira_issue_key}</strong>
+              <span>keep {group.keep_worklog_id}</span>
+              <span>delete {group.delete_worklog_ids.join(", ")}</span>
+            </li>
+          )}</For>
+        </ul>
+      </Show>
+      <div class="recovery-actions">
+        <button type="button" class="secondary" disabled={Boolean(props.busyCommand)} classList={{ loading: checking() }} onClick={() => props.runRecovery(false)}>{checking() ? "Checking..." : "Check recovery"}</button>
+        <button type="button" class="danger" disabled={Boolean(props.busyCommand) || !hasDuplicates()} classList={{ loading: repairing() }} onClick={() => props.runRecovery(true)}>{repairing() ? "Repairing..." : "Repair duplicates"}</button>
+      </div>
+    </section>
   );
 }
 
@@ -856,19 +1009,19 @@ function IssuePanel(props) {
 function Configuration(props) {
   const disabled = () => props.readOnly;
   const newSite = () => ({ key: "", base_url: "", email_env: "", email_value: "", email_present: false, api_token_env: "", api_token_value: "", api_token_present: false, enabled: true, local_id: crypto.randomUUID() });
-  const withLocalIds = (sites) => (sites.length ? sites : [newSite()]).map((site) => ({ ...site, local_id: site.local_id || crypto.randomUUID() }));
-  const [sites, setSites] = createSignal(withLocalIds(props.config.jira_sites || []));
+  const withLocalIds = (jiraSites) => (jiraSites?.length ? jiraSites : [newSite()]).map((site) => ({ ...site, local_id: site.local_id || crypto.randomUUID() }));
+  const [sites, setSites] = createSignal(withLocalIds(props.config.jira_sites));
   const [showTogglToken, setShowTogglToken] = createSignal(false);
   const [showJiraToken, setShowJiraToken] = createSignal(false);
-  createEffect(() => setSites(withLocalIds(props.config.jira_sites || [])));
   const addSite = () => setSites((current) => [...current, newSite()]);
-  const removeSite = (localId) => setSites((current) => current.length === 1 ? current : current.filter((site) => site.local_id !== localId));
+  const removeSite = (localId) => setSites((current) => current.length > 1 ? current.filter((site) => site.local_id !== localId) : current);
   return (
     <form class="panel config-grid" onSubmit={props.saveConfig}>
       <div class="panel-head full"><div><h2>{props.readOnly ? "Tenant configuration" : "Configuration"}</h2><p>{props.readOnly ? "Managed by the tenant administrator." : props.config.path}</p></div><Show when={!props.readOnly}><div class="config-actions"><button class="secondary" type="button" onClick={props.exportConfig}>Export configuration</button><button class="danger" type="button" onClick={props.deleteLocalData}>Delete local data</button><button class="primary" type="submit">Save configuration</button></div></Show></div>
       <label>Workspace ID <input name="toggl_workspace_id" type="number" value={props.config.toggl_workspace_id} required disabled={disabled()} /></label>
       <input type="hidden" name="toggl_api_token_env" value={props.config.toggl_api_token_env || "TOGGL_API_TOKEN"} />
-      <SecretField label="Toggl API token" name="toggl_api_token_value" value={props.config.toggl_api_token_value || ""} visible={showTogglToken()} setVisible={setShowTogglToken} placeholder={props.config.toggl_api_token_present ? "Token saved; leave blank to keep it" : "Paste Toggl API token"} disabled={disabled()} />
+      <SecretField label="Toggl API token" name="toggl_api_token_value" value={props.config.toggl_api_token_value || ""} visible={showTogglToken()} setVisible={setShowTogglToken} placeholder="Paste Toggl API token" disabled={disabled()} />
+      <CredentialCheck name="toggl" checks={props.credentialChecks} onClick={(event) => props.testTogglCredentials(event.currentTarget.form)} disabled={disabled()} label="Test Toggl credentials" />
       <label>SQLite path <input name="sqlite_path" value={props.config.sqlite_path} required disabled={disabled()} /></label>
       <label>Initial sync from month <input name="initial_backfill_from_month" type="month" value={configMonthToInput(props.config.initial_backfill_from_month)} disabled={disabled()} /></label>
       <label>Recovery scan from month <input name="recovery_from_month" type="month" value={configMonthToInput(props.config.recovery_from_month)} disabled={disabled()} /></label>
@@ -880,7 +1033,7 @@ function Configuration(props) {
         <div class="site-card-head">
           <div>
             <h3>Jira sites</h3>
-            <p class="sites-copy">Add every Jira site that might contain your issue keys. Sync checks each enabled site before it writes a worklog.</p>
+            <p class="sites-copy">Add every Jira site that might contain your issue keys. Sync checks each enabled site before it writes a worklog. Use the button here or at the bottom of the list to add another site.</p>
             <span>{sites().length} configured</span>
           </div>
           <Show when={!props.readOnly}><button type="button" class="secondary" onClick={addSite}>Add another Jira site</button></Show>
@@ -888,24 +1041,46 @@ function Configuration(props) {
         <For each={sites()}>{(site, index) => (
           <section class="site-card" data-jira-site>
             <div class="site-card-head"><div><h3>Jira site {index() + 1}</h3><span>{site.key || "New site"}</span></div><Show when={!props.readOnly && sites().length > 1}><button type="button" class="danger" onClick={() => removeSite(site.local_id)}>Remove</button></Show></div>
-            <label>Site key <input name="jira_key" value={site.key || ""} required disabled={disabled()} /></label><label>Base URL <input name="jira_base_url" value={site.base_url || ""} required disabled={disabled()} /></label>
-            <input type="hidden" name="jira_email_env" value={site.email_env || ""} />
-            <label>Jira email <input name="jira_email_value" type="email" value={site.email_value || ""} placeholder={site.email_present ? "Email saved; leave blank to keep it" : "name@example.com"} disabled={disabled()} /></label>
-            <input type="hidden" name="jira_api_token_env" value={site.api_token_env || ""} />
-            <SecretField label="Jira API token" name="jira_api_token_value" value={site.api_token_value || ""} visible={showJiraToken()} setVisible={setShowJiraToken} placeholder={site.api_token_present ? "Token saved; leave blank to keep it" : "Paste Jira API token"} disabled={disabled()} />
-            <label class="check"><input name="jira_enabled" type="checkbox" checked={site.enabled ?? true} disabled={disabled()} /> Enabled</label>
+            <div class="site-card-fields">
+              <label class="site-field site-key-field">Site key <input name="jira_key" value={site.key || ""} placeholder="Leave blank to derive from Base URL" disabled={disabled()} /><span class="field-help">Optional. For https://acme.atlassian.net this becomes acme.</span></label>
+              <label class="site-field">Base URL <input name="jira_base_url" value={site.base_url || ""} placeholder="https://acme.atlassian.net" required disabled={disabled()} /></label>
+              <input type="hidden" name="jira_email_env" value={site.email_env || ""} />
+              <label class="site-field">Jira email <input name="jira_email_value" type="email" value={site.email_value || ""} placeholder="name@example.com" disabled={disabled()} /></label>
+              <input type="hidden" name="jira_api_token_env" value={site.api_token_env || ""} />
+              <SecretField class="site-field" controlClass="site-secret-control" label="Jira API token" name="jira_api_token_value" value={site.api_token_value || ""} visible={showJiraToken()} setVisible={setShowJiraToken} placeholder="Paste Jira API token" disabled={disabled()} />
+              <CredentialCheck name={`jira-${index()}`} checks={props.credentialChecks} onClick={(event) => props.testJiraCredentials(event.currentTarget.closest("[data-jira-site]"), index(), site)} disabled={disabled()} label="Test Jira credentials" />
+            </div>
+            <label class="check site-card-toggle"><input name="jira_enabled" type="checkbox" checked={site.enabled ?? true} disabled={disabled()} /> Enabled</label>
           </section>
         )}</For>
+        <Show when={!props.readOnly}>
+          <div class="sites-footer"><button type="button" class="secondary" onClick={addSite}>Add Jira site</button><span>Need another Atlassian tenant? Add it here, fill Base URL, email and API token, then save.</span></div>
+        </Show>
+      </section>
+      <section class="config-logs full">
+        <div><h3>Logs</h3><p>Open the local app log when a sync fails with a generic load error.</p><code>{props.logPath || "Log path unavailable"}</code></div>
+        <button type="button" class="secondary" onClick={props.openLogFile}>Open logs</button>
       </section>
     </form>
   );
 }
 
+function CredentialCheck(props) {
+  const check = () => props.checks?.[props.name];
+  return (
+    <div class="credential-check">
+      <button type="button" class="secondary" disabled={props.disabled || check()?.status === "running"} onClick={props.onClick}>{check()?.status === "running" ? "Testing…" : props.label}</button>
+      <Show when={check()?.message}><span class={`credential-result ${check()?.status || ""}`}>{check().message}</span></Show>
+    </div>
+  );
+}
+
 function SecretField(props) {
   const type = () => (props.visible ? props.inputType || "text" : "password");
+  const controlClass = () => props.controlClass ? `secret-control ${props.controlClass}` : "secret-control";
   return (
-    <label>{props.label}
-      <span class="secret-control">
+    <label class={props.class}>{props.label}
+      <span class={controlClass()}>
         <input name={props.name} type={type()} value={props.value} placeholder={props.placeholder} disabled={props.disabled} />
         <button type="button" class="secret-toggle" aria-label={props.visible ? `Hide ${props.label}` : `Show ${props.label}`} title={props.visible ? "Hide" : "Show"} disabled={props.disabled} onClick={() => props.setVisible(!props.visible)}><EyeIcon hidden={props.visible} /></button>
       </span>

@@ -2,7 +2,7 @@ use httpmock::{Method, MockServer};
 use serde_json::json;
 use tempfile::NamedTempFile;
 use toggl_jira_sync::{
-    db::Database,
+    db::{Database, NewJiraWorklogLink},
     jira::{JiraClient, TogglSyncMarker, MARKER_PROPERTY_KEY},
     sync::{
         executor::{execute_plan, ExecutorOptions},
@@ -113,6 +113,7 @@ async fn recovery_after_db_delete_prevents_duplicate_create() {
         recovery_sites: vec![recovery_site(&server)],
         recovery_scan_days: 180,
         requested_scan_days: None,
+        repair_duplicates: false,
     })
     .await
     .expect("recovery should reconstruct DB link");
@@ -185,11 +186,229 @@ async fn recovery_never_mutates_jira() {
         recovery_sites: vec![recovery_site(&server)],
         recovery_scan_days: 180,
         requested_scan_days: None,
+        repair_duplicates: false,
     })
     .await
     .expect("read-only recovery should pass");
 
     assert_eq!(mutations.hits(), 0);
+}
+
+#[tokio::test]
+async fn recovery_reports_external_and_marked_duplicate_without_repair() {
+    let (_file, db) = temp_database();
+    let server = MockServer::start();
+    let description = "SAB-123 created entry";
+    let expected_hash = source_hash(description);
+    server.mock(|when, then| {
+        when.method(Method::GET)
+            .path(format!("/rest/api/3/issue/{ISSUE_KEY}/worklog"));
+        then.status(200).json_body(json!({
+            "worklogs": [
+                {
+                    "id": WORKLOG_ID,
+                    "timeSpentSeconds": 1800,
+                    "started": "2024-05-02T01:00:00.000+0200",
+                    "comment": {"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"inlineCard","attrs":{"text":"SAB-123"}},{"type":"text","text":" created entry"}]}]}
+                },
+                {
+                    "id": WORKLOG_ID_DUPLICATE,
+                    "timeSpentSeconds": 1800,
+                    "started": "2024-05-02T01:00:00.000+0000",
+                    "comment": {"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"SAB-123 created entry"}]}]}
+                }
+            ]
+        }));
+    });
+    server.mock(|when, then| {
+        when.method(Method::GET).path(format!(
+            "/rest/api/3/issue/{ISSUE_KEY}/worklog/{WORKLOG_ID}/properties/{MARKER_PROPERTY_KEY}"
+        ));
+        then.status(404)
+            .json_body(json!({ "errorMessages": ["missing property"] }));
+    });
+    server.mock(|when, then| {
+        when.method(Method::GET).path(format!(
+            "/rest/api/3/issue/{ISSUE_KEY}/worklog/{WORKLOG_ID_DUPLICATE}/properties/{MARKER_PROPERTY_KEY}"
+        ));
+        then.status(200)
+            .json_body(json!({ "key": MARKER_PROPERTY_KEY, "value": marker(&expected_hash) }));
+    });
+    let mutations = server.mock(|when, then| {
+        when.any_request()
+            .matches(|request| matches!(request.method.as_str(), "PUT" | "DELETE"));
+        then.status(500).body("plain recovery must not mutate Jira");
+    });
+
+    let report = recover(RecoveryInput {
+        database: &db,
+        entries: vec![entry(description)],
+        issue_site_mappings: vec![issue_site_mapping()],
+        recovery_sites: vec![recovery_site(&server)],
+        recovery_scan_days: 180,
+        requested_scan_days: None,
+        repair_duplicates: false,
+    })
+    .await
+    .expect("duplicate recovery report should pass");
+
+    assert_eq!(report.duplicate_repairs_applied, 0);
+    assert_eq!(report.duplicate_worklogs.len(), 1);
+    let duplicate = &report.duplicate_worklogs[0];
+    assert_eq!(duplicate.keep_worklog_id, WORKLOG_ID);
+    assert_eq!(duplicate.delete_worklog_ids, vec![WORKLOG_ID_DUPLICATE]);
+    assert_eq!(mutations.hits(), 0);
+}
+
+#[tokio::test]
+async fn recovery_repairs_deterministic_external_and_marked_duplicate() {
+    let (_file, db) = temp_database();
+    let server = MockServer::start();
+    let description = "SAB-123 created entry";
+    let expected_hash = source_hash(description);
+    server.mock(|when, then| {
+        when.method(Method::GET)
+            .path(format!("/rest/api/3/issue/{ISSUE_KEY}/worklog"));
+        then.status(200).json_body(json!({
+            "worklogs": [
+                {
+                    "id": WORKLOG_ID,
+                    "timeSpentSeconds": 1800,
+                    "started": "2024-05-02T01:00:00.000+0200",
+                    "comment": {"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"SAB-123 created entry"}]}]}
+                },
+                {
+                    "id": WORKLOG_ID_DUPLICATE,
+                    "timeSpentSeconds": 1800,
+                    "started": "2024-05-02T01:00:00.000+0000",
+                    "comment": {"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"SAB-123 created entry"}]}]}
+                }
+            ]
+        }));
+    });
+    server.mock(|when, then| {
+        when.method(Method::GET).path(format!(
+            "/rest/api/3/issue/{ISSUE_KEY}/worklog/{WORKLOG_ID}/properties/{MARKER_PROPERTY_KEY}"
+        ));
+        then.status(404)
+            .json_body(json!({ "errorMessages": ["missing property"] }));
+    });
+    server.mock(|when, then| {
+        when.method(Method::GET).path(format!(
+            "/rest/api/3/issue/{ISSUE_KEY}/worklog/{WORKLOG_ID_DUPLICATE}/properties/{MARKER_PROPERTY_KEY}"
+        ));
+        then.status(200)
+            .json_body(json!({ "key": MARKER_PROPERTY_KEY, "value": marker(&expected_hash) }));
+    });
+    let mark_keep = server.mock(|when, then| {
+        when.method(Method::PUT).path(format!(
+            "/rest/api/3/issue/{ISSUE_KEY}/worklog/{WORKLOG_ID}/properties/{MARKER_PROPERTY_KEY}"
+        ));
+        then.status(200);
+    });
+    let delete_duplicate = server.mock(|when, then| {
+        when.method(Method::DELETE).path(format!(
+            "/rest/api/3/issue/{ISSUE_KEY}/worklog/{WORKLOG_ID_DUPLICATE}"
+        ));
+        then.status(204);
+    });
+
+    let report = recover(RecoveryInput {
+        database: &db,
+        entries: vec![entry(description)],
+        issue_site_mappings: vec![issue_site_mapping()],
+        recovery_sites: vec![recovery_site(&server)],
+        recovery_scan_days: 180,
+        requested_scan_days: None,
+        repair_duplicates: true,
+    })
+    .await
+    .expect("deterministic duplicate repair should pass");
+
+    assert_eq!(report.duplicate_repairs_applied, 1);
+    assert_eq!(report.duplicate_worklogs.len(), 1);
+    mark_keep.assert_hits(1);
+    delete_duplicate.assert_hits(1);
+    let stored = db
+        .get_jira_worklog_link("700001", "900001", SITE_KEY)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.jira_worklog_id.as_deref(), Some(WORKLOG_ID));
+    assert_eq!(stored.status, "adopted");
+}
+
+#[tokio::test]
+async fn recovery_repairs_duplicate_proven_by_local_link() {
+    let (_file, db) = temp_database();
+    let server = MockServer::start();
+    let description = "SAB-123 created entry";
+    let expected_hash = source_hash(description);
+    db.upsert_jira_worklog_link(&NewJiraWorklogLink {
+        toggl_workspace_id: "700001",
+        toggl_entry_id: "900001",
+        jira_site_key: SITE_KEY,
+        jira_issue_key: ISSUE_KEY,
+        jira_worklog_id: Some(WORKLOG_ID_DUPLICATE),
+        source_hash: &expected_hash,
+        rounded_duration_seconds: 1_800,
+        status: "created",
+    })
+    .unwrap();
+    server.mock(|when, then| {
+        when.method(Method::GET)
+            .path(format!("/rest/api/3/issue/{ISSUE_KEY}/worklog"));
+        then.status(200).json_body(json!({
+            "worklogs": [
+                {
+                    "id": WORKLOG_ID,
+                    "timeSpentSeconds": 1800,
+                    "started": "2024-05-02T01:00:00.000+0200",
+                    "comment": {"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"SAB-123 created entry"}]}]}
+                },
+                {
+                    "id": WORKLOG_ID_DUPLICATE,
+                    "timeSpentSeconds": 1800,
+                    "started": "2024-05-02T01:00:00.000+0000",
+                    "comment": {"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"SAB-123 created entry"}]}]}
+                }
+            ]
+        }));
+    });
+    for worklog_id in [WORKLOG_ID, WORKLOG_ID_DUPLICATE] {
+        server.mock(|when, then| {
+            when.method(Method::GET).path(format!(
+                "/rest/api/3/issue/{ISSUE_KEY}/worklog/{worklog_id}/properties/{MARKER_PROPERTY_KEY}"
+            ));
+            then.status(404)
+                .json_body(json!({ "errorMessages": ["missing property"] }));
+        });
+    }
+    let mark_any = server.mock(|when, then| {
+        when.method(Method::PUT);
+        then.status(200);
+    });
+    let delete_duplicate = server.mock(|when, then| {
+        when.method(Method::DELETE).path(format!(
+            "/rest/api/3/issue/{ISSUE_KEY}/worklog/{WORKLOG_ID_DUPLICATE}"
+        ));
+        then.status(204);
+    });
+
+    let report = recover(RecoveryInput {
+        database: &db,
+        entries: vec![entry(description)],
+        issue_site_mappings: vec![issue_site_mapping()],
+        recovery_sites: vec![recovery_site(&server)],
+        recovery_scan_days: 180,
+        requested_scan_days: None,
+        repair_duplicates: true,
+    })
+    .await
+    .expect("local-link duplicate repair should pass");
+
+    assert_eq!(report.duplicate_repairs_applied, 1);
+    assert_eq!(mark_any.hits(), 2);
+    delete_duplicate.assert_hits(1);
 }
 
 #[tokio::test]
@@ -227,6 +446,7 @@ async fn recovery_duplicate_marked_worklogs_report_conflict() {
         recovery_sites: vec![recovery_site(&server)],
         recovery_scan_days: 180,
         requested_scan_days: None,
+        repair_duplicates: false,
     })
     .await
     .expect("duplicates should be reported, not fatal");
@@ -262,6 +482,7 @@ async fn recovery_warns_when_requested_range_exceeds_configured_window() {
         recovery_sites: vec![recovery_site(&server)],
         recovery_scan_days: 180,
         requested_scan_days: Some(365),
+        repair_duplicates: false,
     })
     .await
     .expect("bounded recovery should warn but continue");
@@ -303,6 +524,7 @@ async fn recovery_uses_comment_fallback_marker_when_property_is_missing() {
         recovery_sites: vec![recovery_site(&server)],
         recovery_scan_days: 180,
         requested_scan_days: None,
+        repair_duplicates: false,
     })
     .await
     .expect("comment fallback recovery should pass");

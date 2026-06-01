@@ -104,6 +104,7 @@ pub struct PlannedDelete {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipCause {
     MissingIssueKey,
+    UnresolvedIssueSite { issue_key: String },
     RoundedDurationZero,
     RunningEntry,
     MissingManagedWorklog,
@@ -224,6 +225,12 @@ fn plan_entry(
     };
     let site_key = match resolve_site_key(&issue_key, issue_sites) {
         Ok(site_key) => site_key,
+        Err(PlannerIssue::UnresolvedIssueSite { issue_key }) => {
+            return (
+                PlannerOutcome::Skip(SkipCause::UnresolvedIssueSite { issue_key }),
+                Vec::new(),
+            );
+        }
         Err(issue) => return (PlannerOutcome::Error(issue), Vec::new()),
     };
     let rounded_duration_seconds = round_to_nearest_minute(entry.duration_seconds);

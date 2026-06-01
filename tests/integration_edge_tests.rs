@@ -11,7 +11,7 @@ use toggl_jira_sync::{
         executor::{execute_plan, ExecutorOptions, MutationStatus},
         planner::{
             compute_source_hash, plan_sync, ExistingWorklogLink, IssueSiteMapping, PlannedMutation,
-            PlannerInput, PlannerIssue, PlannerOutcome, SkipCause,
+            PlannerInput, PlannerOutcome, SkipCause,
         },
         recovery::{recover, RecoveryConflict, RecoveryInput, RecoverySite, RecoveryWarning},
     },
@@ -195,14 +195,14 @@ fn integration_edge_multiple_issue_keys_uses_only_resolved_key() {
 }
 
 #[test]
-fn integration_edge_unknown_jira_site_errors_without_jira_mutation() {
+fn integration_edge_unknown_jira_site_skips_without_jira_mutation() {
     let plan = plan_sync(default_input(vec![entry(ENTRY_ID, "Work on OPS-123")]))
         .expect("planner should not fail globally");
 
     assert!(plan.mutations.is_empty());
     assert!(matches!(
         &plan.entries[0].outcome,
-        PlannerOutcome::Error(PlannerIssue::UnresolvedIssueSite { issue_key })
+        PlannerOutcome::Skip(SkipCause::UnresolvedIssueSite { issue_key })
             if issue_key == "OPS-123"
     ));
 }
@@ -492,6 +492,7 @@ async fn integration_edge_timeout_after_create_no_duplicate() {
         &database,
         ExecutorOptions {
             crash_after_remote_create: true,
+            ..ExecutorOptions::default()
         },
     )
     .await
@@ -556,7 +557,7 @@ fn integration_edge_dst_timezone_offset_preserved_in_worklog_draft_and_hash() {
 async fn integration_edge_large_initial_backfill_uses_bounded_pages_windows() {
     let now = 1_714_604_800;
     let requested_since = now - 365 * 24 * 60 * 60;
-    let bounded_since = 1_714_521_600;
+    let bounded_since = 1_713_395_200;
     let toggl_server = MockServer::start();
     let bounded_fetch = toggl_server.mock(|when, then| {
         when.method(Method::GET)
@@ -609,6 +610,7 @@ async fn integration_edge_large_initial_backfill_uses_bounded_pages_windows() {
         }],
         recovery_scan_days: 14,
         requested_scan_days: Some(365),
+        repair_duplicates: false,
     })
     .await
     .expect("bounded recovery should warn and continue");
@@ -666,6 +668,7 @@ async fn integration_edge_duplicate_marked_jira_worklogs_conflict_without_destru
         }],
         recovery_scan_days: 180,
         requested_scan_days: None,
+        repair_duplicates: false,
     })
     .await
     .expect("duplicate markers should be reported, not fatal");

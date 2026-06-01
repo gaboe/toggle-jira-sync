@@ -1,5 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf};
 
+const DESKTOP_SECRETS_HEADER: &str = "x-tjs-desktop-secrets";
+
 use anyhow::{anyhow, Context};
 use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
@@ -81,6 +83,25 @@ pub struct LocalApiClient {
     client: reqwest::Client,
 }
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct TestTogglCredentialsRequest {
+    pub base_url: Option<String>,
+    pub api_token: String,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct TestJiraCredentialsRequest {
+    pub base_url: String,
+    pub email: String,
+    pub api_token: String,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct CredentialTestResponse {
+    pub ok: bool,
+    pub message: String,
+}
+
 impl LocalApiClient {
     pub fn new(base_url: String) -> Self {
         Self {
@@ -124,8 +145,17 @@ impl LocalApiClient {
         .await
     }
 
-    pub async fn recover_command(&self) -> anyhow::Result<RecoveryCommandReport> {
-        self.post_empty_json("/api/recover/command").await
+    pub async fn recover_command(
+        &self,
+        repair_duplicates: bool,
+    ) -> anyhow::Result<RecoveryCommandReport> {
+        self.post_json(
+            "/api/recover/command",
+            &serde_json::json!({
+                "repair_duplicates": repair_duplicates,
+            }),
+        )
+        .await
     }
 
     pub async fn doctor_command(&self, online: bool) -> anyhow::Result<DoctorCommandReport> {
@@ -210,10 +240,29 @@ impl LocalApiClient {
         self.put_json("/api/config", update).await
     }
 
+    pub async fn test_toggl_credentials(
+        &self,
+        request: &TestTogglCredentialsRequest,
+    ) -> anyhow::Result<CredentialTestResponse> {
+        self.post_json("/api/config/test-toggl", request).await
+    }
+
+    pub async fn test_jira_credentials(
+        &self,
+        request: &TestJiraCredentialsRequest,
+    ) -> anyhow::Result<CredentialTestResponse> {
+        self.post_json("/api/config/test-jira", request).await
+    }
+
+    pub async fn log_file(&self) -> anyhow::Result<crate::app::LogFileResult> {
+        self.get_json("/api/log-file").await
+    }
+
     pub async fn delete_local_data(&self) -> anyhow::Result<DeleteLocalDataResult> {
         let response = self
             .client
             .delete(format!("{}/api/local-data", self.base_url))
+            .header(DESKTOP_SECRETS_HEADER, "1")
             .send()
             .await
             .context("failed to call local server /api/local-data")?;
@@ -228,6 +277,7 @@ impl LocalApiClient {
         let response = self
             .client
             .get(format!("{}{}", self.base_url, path))
+            .header(DESKTOP_SECRETS_HEADER, "1")
             .send()
             .await
             .with_context(|| format!("failed to call local server {path}"))?;
@@ -238,6 +288,7 @@ impl LocalApiClient {
         let response = self
             .client
             .post(format!("{}{}", self.base_url, path))
+            .header(DESKTOP_SECRETS_HEADER, "1")
             .send()
             .await
             .with_context(|| format!("failed to call local server {path}"))?;
@@ -252,6 +303,7 @@ impl LocalApiClient {
         let response = self
             .client
             .post(format!("{}{}", self.base_url, path))
+            .header(DESKTOP_SECRETS_HEADER, "1")
             .json(body)
             .send()
             .await
@@ -267,6 +319,7 @@ impl LocalApiClient {
         let response = self
             .client
             .patch(format!("{}{}", self.base_url, path))
+            .header(DESKTOP_SECRETS_HEADER, "1")
             .json(body)
             .send()
             .await
@@ -282,6 +335,7 @@ impl LocalApiClient {
         let response = self
             .client
             .put(format!("{}{}", self.base_url, path))
+            .header(DESKTOP_SECRETS_HEADER, "1")
             .json(body)
             .send()
             .await

@@ -13,6 +13,8 @@ recovery_scan_days = 180
 toggl_max_rps = 1.0
 jira_global_write_delay_ms = 150
 jira_same_issue_write_delay_ms = 2000
+jira_max_rate_limit_retries = 8
+jira_max_parallel_groups = 4
 
 [jira]
 

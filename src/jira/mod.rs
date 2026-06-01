@@ -2,17 +2,18 @@ use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::{header::HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 
 pub const MARKER_PROPERTY_KEY: &str = "com.toggl_jira_sync";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_RATE_LIMIT_RETRIES: usize = 2;
+const DEFAULT_MAX_RATE_LIMIT_RETRIES: usize = 2;
 
 pub trait Sleeper: Clone + Send + Sync + 'static {
     fn sleep<'a>(&'a self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -27,10 +28,21 @@ impl Sleeper for TokioSleeper {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JiraWritePacing {
     pub global_write_delay: Duration,
     pub same_issue_write_delay: Duration,
+    pub max_rate_limit_retries: usize,
+}
+
+impl Default for JiraWritePacing {
+    fn default() -> Self {
+        Self {
+            global_write_delay: Duration::ZERO,
+            same_issue_write_delay: Duration::ZERO,
+            max_rate_limit_retries: DEFAULT_MAX_RATE_LIMIT_RETRIES,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -327,6 +339,12 @@ impl<S: Sleeper> JiraClient<S> {
         }
     }
 
+    pub async fn validate_credentials(&self) -> Result<(), JiraError> {
+        let url = format!("{}/rest/api/3/myself", self.base_url);
+        let response = self.send_with_retry(|| self.http.get(&url)).await?;
+        decode_success::<Value>(response).await.map(|_| ())
+    }
+
     pub async fn update_marked_worklog(
         &self,
         issue_key: &str,
@@ -359,6 +377,13 @@ impl<S: Sleeper> JiraClient<S> {
         expect_empty_success(response).await
     }
 
+    pub async fn delete_worklog(&self, issue_key: &str, worklog_id: &str) -> Result<(), JiraError> {
+        let url = self.worklog_url(issue_key, worklog_id);
+        self.before_jira_write(issue_key).await;
+        let response = self.send_with_retry(|| self.http.delete(&url)).await?;
+        expect_empty_success(response).await
+    }
+
     async fn write_comment_fallback_marker(
         &self,
         issue_key: &str,
@@ -378,30 +403,24 @@ impl<S: Sleeper> JiraClient<S> {
     }
 
     async fn before_jira_write(&self, issue_key: &str) {
-        let delay = {
-            let mut state = self
-                .write_pacing_state
-                .lock()
-                .expect("Jira write pacing state lock should not poison");
-            let delay = if state.has_written {
-                if state.written_issue_keys.contains(issue_key) {
-                    self.write_pacing
-                        .same_issue_write_delay
-                        .max(self.write_pacing.global_write_delay)
-                } else {
-                    self.write_pacing.global_write_delay
-                }
+        let mut state = self.write_pacing_state.lock().await;
+        let delay = if state.has_written {
+            if state.written_issue_keys.contains(issue_key) {
+                self.write_pacing
+                    .same_issue_write_delay
+                    .max(self.write_pacing.global_write_delay)
             } else {
-                Duration::ZERO
-            };
-            state.has_written = true;
-            state.written_issue_keys.insert(issue_key.to_owned());
-            delay
+                self.write_pacing.global_write_delay
+            }
+        } else {
+            Duration::ZERO
         };
 
         if delay > Duration::ZERO {
             self.sleeper.sleep(delay).await;
         }
+        state.has_written = true;
+        state.written_issue_keys.insert(issue_key.to_owned());
     }
 
     async fn verify_marker(
@@ -468,7 +487,8 @@ impl<S: Sleeper> JiraClient<S> {
         &self,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, JiraError> {
-        for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+        let max_retries = self.write_pacing.max_rate_limit_retries;
+        for attempt in 0..=max_retries {
             let response = build()
                 .basic_auth(&self.email, Some(&self.api_token))
                 .send()
@@ -480,7 +500,7 @@ impl<S: Sleeper> JiraClient<S> {
 
             let retry_after = parse_retry_after(response.headers());
             let message = response_error_text(response).await;
-            if attempt == MAX_RATE_LIMIT_RETRIES {
+            if attempt == max_retries {
                 return Err(JiraError::RateLimited {
                     retry_after,
                     message,

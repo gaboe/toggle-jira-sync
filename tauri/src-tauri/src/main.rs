@@ -4,10 +4,14 @@ use tauri::Manager;
 use toggl_jira_sync::{
     app::{
         AppStateSnapshot, ConfigOnlySnapshot, ConfigSnapshot, ConfigUpdate, DeleteLocalDataResult,
-        ExportConfigResult, ScheduleSnapshot,
+        ExportConfigResult, LogFileResult, ScheduleSnapshot,
     },
     format_error_chain,
-    local_api::LocalApiClient,
+    local_api::{
+        CredentialTestResponse, LocalApiClient, TestJiraCredentialsRequest,
+        TestTogglCredentialsRequest,
+    },
+    commands::recover::RecoveryCommandReport,
     report::StatusReport,
 };
 
@@ -41,6 +45,16 @@ async fn sync(api: tauri::State<'_, LocalApiClient>) -> Result<AppStateSnapshot,
 }
 
 #[tauri::command]
+async fn recover_command(
+    api: tauri::State<'_, LocalApiClient>,
+    repair_duplicates: bool,
+) -> Result<RecoveryCommandReport, String> {
+    api.recover_command(repair_duplicates)
+        .await
+        .map_err(format_tauri_error)
+}
+
+#[tauri::command]
 async fn toggle_schedule(
     api: tauri::State<'_, LocalApiClient>,
     enabled: bool,
@@ -56,6 +70,27 @@ async fn save_config(
     update: ConfigUpdate,
 ) -> Result<ConfigSnapshot, String> {
     api.save_config(&update).await.map_err(format_tauri_error)
+}
+
+#[tauri::command]
+async fn test_toggl_credentials(
+    api: tauri::State<'_, LocalApiClient>,
+    request: TestTogglCredentialsRequest,
+) -> Result<CredentialTestResponse, String> {
+    api.test_toggl_credentials(&request).await.map_err(format_tauri_error)
+}
+
+#[tauri::command]
+async fn test_jira_credentials(
+    api: tauri::State<'_, LocalApiClient>,
+    request: TestJiraCredentialsRequest,
+) -> Result<CredentialTestResponse, String> {
+    api.test_jira_credentials(&request).await.map_err(format_tauri_error)
+}
+
+#[tauri::command]
+async fn log_file(api: tauri::State<'_, LocalApiClient>) -> Result<LogFileResult, String> {
+    api.log_file().await.map_err(format_tauri_error)
 }
 
 #[tauri::command]
@@ -127,7 +162,7 @@ fn main() {
 
             if let Some(window) = app.get_webview_window("main") {
                 window.eval(&format!(
-                    "window.__TJS_API_BASE_URL__ = {};",
+                    "window.__TJS_API_BASE_URL__ = {}; window.__TJS_DESKTOP_SECRETS__ = true;",
                     serde_json::to_string(&api_base_url)?
                 ))?;
             }
@@ -139,8 +174,12 @@ fn main() {
             status,
             dry_run,
             sync,
+            recover_command,
             toggle_schedule,
             save_config,
+            test_toggl_credentials,
+            test_jira_credentials,
+            log_file,
             delete_local_data,
             export_config,
             open_url

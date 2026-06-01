@@ -286,6 +286,9 @@ fn skip_reason(cause: SkipCause) -> String {
         SkipCause::MissingIssueKey => {
             "no valid Jira issue key found in Toggl description".to_owned()
         }
+        SkipCause::UnresolvedIssueSite { issue_key } => {
+            format!("Jira issue {issue_key} was not found on any enabled Jira site")
+        }
         SkipCause::RoundedDurationZero => "rounded duration is zero".to_owned(),
         SkipCause::RunningEntry => "running entry".to_owned(),
         SkipCause::MissingManagedWorklog => "missing managed Jira worklog".to_owned(),

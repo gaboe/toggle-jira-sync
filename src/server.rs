@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::Context;
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -16,7 +16,8 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use crate::{
     app::{
         self, AppStateSnapshot, ConfigOnlySnapshot, ConfigSnapshot, ConfigUpdate,
-        DeleteLocalDataResult, ExportConfigResult, ScheduleCommandStatus, ScheduleSnapshot,
+        DeleteLocalDataResult, ExportConfigResult, LogFileResult, ScheduleCommandStatus,
+        ScheduleSnapshot,
     },
     cli::{DoctorArgs, RecoverArgs, ServerArgs, ServerMode, SharedPaths, SyncArgs},
     commands::{
@@ -73,6 +74,12 @@ struct SyncCommandRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct RecoverCommandRequest {
+    #[serde(default)]
+    repair_duplicates: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct DoctorCommandRequest {
     online: bool,
 }
@@ -80,6 +87,25 @@ struct DoctorCommandRequest {
 #[derive(Debug, Deserialize)]
 struct ConfigShowCommandRequest {
     show_secrets: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TestTogglCredentialsRequest {
+    base_url: Option<String>,
+    api_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TestJiraCredentialsRequest {
+    base_url: String,
+    email: String,
+    api_token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CredentialTestResponse {
+    ok: bool,
+    message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -174,6 +200,9 @@ pub fn router(
                 "/api/config/discover-toggl-workspaces/command",
                 post(config_discover_toggl_workspaces_command),
             )
+            .route("/api/config/test-toggl", post(test_toggl_credentials))
+            .route("/api/config/test-jira", post(test_jira_credentials))
+            .route("/api/log-file", get(log_file))
             .route("/api/schedule", get(schedule_status).patch(update_schedule))
             .route("/api/schedule/install", post(install_schedule))
             .route("/api/schedule/uninstall", post(uninstall_schedule))
@@ -196,6 +225,8 @@ fn cors_layer() -> CorsLayer {
             origin.to_str().ok().is_some_and(|origin| {
                 origin.starts_with("http://127.0.0.1:")
                     || origin.starts_with("http://localhost:")
+                    || origin == "tauri://localhost"
+                    || origin == "http://tauri.localhost"
                     || std::env::var("TJS_ALLOWED_ORIGINS")
                         .ok()
                         .is_some_and(|origins| {
@@ -213,6 +244,7 @@ fn cors_layer() -> CorsLayer {
         .allow_headers([
             axum::http::header::CONTENT_TYPE,
             axum::http::header::AUTHORIZATION,
+            HeaderName::from_static("x-tjs-desktop-secrets"),
         ])
 }
 
@@ -230,19 +262,25 @@ async fn me(
     }))
 }
 
-async fn snapshot(State(state): State<Arc<ServerState>>) -> ApiResult<AppStateSnapshot> {
+async fn snapshot(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> ApiResult<AppStateSnapshot> {
     app::snapshot_with_credentials(
         state.paths.clone(),
         state.limit,
         state.credentials_path.clone(),
     )
-    .map(|snapshot| Json(snapshot.redacted()))
+    .map(|snapshot| Json(maybe_redact_snapshot(snapshot, &headers)))
     .map_err(ApiError::from)
 }
 
-async fn config_snapshot(State(state): State<Arc<ServerState>>) -> ApiResult<ConfigOnlySnapshot> {
+async fn config_snapshot(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> ApiResult<ConfigOnlySnapshot> {
     app::config_snapshot_with_credentials(state.paths.clone(), state.credentials_path.clone())
-        .map(|snapshot| Json(snapshot.redacted()))
+        .map(|snapshot| Json(maybe_redact_config_snapshot(snapshot, &headers)))
         .map_err(ApiError::from)
 }
 
@@ -253,39 +291,71 @@ async fn status(State(state): State<Arc<ServerState>>) -> ApiResult<StatusReport
 }
 
 async fn dry_run(State(state): State<Arc<ServerState>>) -> ApiResult<AppStateSnapshot> {
-    run_sync_off_thread(
+    if let Err(error) = run_sync_off_thread(
         state.paths.clone(),
         state.credentials_path.clone(),
         true,
         false,
     )
     .await
-    .map_err(ApiError::from)?;
+    {
+        app::append_log(&format!("dry_run failed: {}", format_error_chain(&error)));
+        return Err(ApiError::from(error));
+    }
     app::snapshot_with_credentials(
         state.paths.clone(),
         state.limit,
         state.credentials_path.clone(),
     )
-    .map(|snapshot| Json(snapshot.redacted()))
+    .map(|snapshot| Json(maybe_redact_snapshot(snapshot, &HeaderMap::new())))
     .map_err(ApiError::from)
 }
 
 async fn sync(State(state): State<Arc<ServerState>>) -> ApiResult<AppStateSnapshot> {
-    run_sync_off_thread(
+    if let Err(error) = run_sync_off_thread(
         state.paths.clone(),
         state.credentials_path.clone(),
         false,
         true,
     )
     .await
-    .map_err(ApiError::from)?;
+    {
+        app::append_log(&format!("sync failed: {}", format_error_chain(&error)));
+        return Err(ApiError::from(error));
+    }
     app::snapshot_with_credentials(
         state.paths.clone(),
         state.limit,
         state.credentials_path.clone(),
     )
-    .map(|snapshot| Json(snapshot.redacted()))
+    .map(|snapshot| Json(maybe_redact_snapshot(snapshot, &HeaderMap::new())))
     .map_err(ApiError::from)
+}
+
+fn maybe_redact_snapshot(snapshot: AppStateSnapshot, headers: &HeaderMap) -> AppStateSnapshot {
+    if desktop_secrets_allowed(headers) {
+        snapshot
+    } else {
+        snapshot.redacted()
+    }
+}
+
+fn maybe_redact_config_snapshot(
+    snapshot: ConfigOnlySnapshot,
+    headers: &HeaderMap,
+) -> ConfigOnlySnapshot {
+    if desktop_secrets_allowed(headers) {
+        snapshot
+    } else {
+        snapshot.redacted()
+    }
+}
+
+fn desktop_secrets_allowed(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-tjs-desktop-secrets")
+        .and_then(|value| value.to_str().ok())
+        == Some("1")
 }
 
 async fn run_sync_off_thread(
@@ -352,6 +422,7 @@ async fn sync_command(
 async fn run_recover_command_off_thread(
     paths: SharedPaths,
     credentials_path: Option<PathBuf>,
+    repair_duplicates: bool,
 ) -> anyhow::Result<RecoveryCommandReport> {
     tokio::task::spawn_blocking(move || {
         tokio::runtime::Builder::new_current_thread()
@@ -359,7 +430,11 @@ async fn run_recover_command_off_thread(
             .build()
             .context("failed to start recover runtime")?
             .block_on(async move {
-                let args = RecoverArgs { paths, json: false };
+                let args = RecoverArgs {
+                    paths,
+                    repair_duplicates,
+                    json: false,
+                };
                 if let Some(credentials_path) = credentials_path {
                     crate::commands::recover::recover_report_with_isolated_credentials(
                         args,
@@ -377,11 +452,19 @@ async fn run_recover_command_off_thread(
 
 async fn recover_command(
     State(state): State<Arc<ServerState>>,
+    request: Option<Json<RecoverCommandRequest>>,
 ) -> ApiResult<RecoveryCommandReport> {
-    run_recover_command_off_thread(state.paths.clone(), state.credentials_path.clone())
-        .await
-        .map(Json)
-        .map_err(ApiError::from)
+    let repair_duplicates = request
+        .map(|Json(request)| request.repair_duplicates)
+        .unwrap_or(false);
+    run_recover_command_off_thread(
+        state.paths.clone(),
+        state.credentials_path.clone(),
+        repair_duplicates,
+    )
+    .await
+    .map(Json)
+    .map_err(ApiError::from)
 }
 
 async fn run_doctor_command_off_thread(
@@ -468,6 +551,46 @@ async fn config_discover_toggl_workspaces_command(
         .map_err(|error| ApiError::from(anyhow::anyhow!(error)))
 }
 
+async fn test_toggl_credentials(
+    Json(request): Json<TestTogglCredentialsRequest>,
+) -> ApiResult<CredentialTestResponse> {
+    let base_url = request
+        .base_url
+        .unwrap_or_else(|| "https://api.track.toggl.com".to_owned());
+    TogglClient::list_workspaces(&base_url, &request.api_token)
+        .await
+        .map(|workspaces| {
+            Json(CredentialTestResponse {
+                ok: true,
+                message: format!(
+                    "Toggl credentials work. {} workspace(s) visible.",
+                    workspaces.len()
+                ),
+            })
+        })
+        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))
+}
+
+async fn test_jira_credentials(
+    Json(request): Json<TestJiraCredentialsRequest>,
+) -> ApiResult<CredentialTestResponse> {
+    let client = crate::jira::JiraClient::from_credentials(
+        request.base_url,
+        request.email,
+        request.api_token,
+    );
+    client
+        .validate_credentials()
+        .await
+        .map(|_| {
+            Json(CredentialTestResponse {
+                ok: true,
+                message: "Jira credentials work.".to_owned(),
+            })
+        })
+        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))
+}
+
 async fn schedule_status(
     State(state): State<Arc<ServerState>>,
 ) -> ApiResult<ScheduleCommandStatus> {
@@ -513,6 +636,10 @@ async fn delete_local_data(
     app::delete_local_data(state.paths.clone())
         .map(Json)
         .map_err(ApiError::from)
+}
+
+async fn log_file() -> ApiResult<LogFileResult> {
+    app::log_file().map(Json).map_err(ApiError::from)
 }
 
 async fn export_config(State(state): State<Arc<ServerState>>) -> ApiResult<ExportConfigResult> {

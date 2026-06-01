@@ -18,6 +18,7 @@ use crate::{
         },
         resolver::{IssueSiteResolutionError, IssueSiteResolver, ResolverSite},
     },
+    time::unique_run_id,
     toggl::{TogglClient, TogglClientConfig, TogglTimeEntry},
 };
 
@@ -30,6 +31,8 @@ pub struct RecoveryCommandReport {
     pub scanned_issues: usize,
     pub scanned_worklogs: usize,
     pub recovered_links: usize,
+    pub duplicate_worklogs: Vec<crate::sync::recovery::DuplicateWorklogGroup>,
+    pub duplicate_repairs_applied: usize,
     pub conflicts: Vec<RecoveryConflict>,
     pub warnings: Vec<RecoveryWarning>,
 }
@@ -42,6 +45,8 @@ impl From<RecoveryReport> for RecoveryCommandReport {
             scanned_issues: report.scanned_issues,
             scanned_worklogs: report.scanned_worklogs,
             recovered_links: report.recovered_links,
+            duplicate_worklogs: report.duplicate_worklogs,
+            duplicate_repairs_applied: report.duplicate_repairs_applied,
             conflicts: report.conflicts,
             warnings: report.warnings,
         }
@@ -62,7 +67,10 @@ impl RecoveryCommandReport {
 pub async fn run(args: RecoverArgs) -> anyhow::Result<()> {
     let json = args.json;
     let server = LocalServer::start(args.paths.clone(), None, 200).await?;
-    let report = server.client().recover_command().await?;
+    let report = server
+        .client()
+        .recover_command(args.repair_duplicates)
+        .await?;
     report.print(json)
 }
 
@@ -96,9 +104,10 @@ pub(crate) async fn recover_report(
     let lock = database
         .acquire_sync_lock("recover")
         .context("failed to acquire sync lock")?;
+    let run_id = unique_run_id("recover");
     database
         .insert_sync_run(&NewSyncRun {
-            run_id: &format!("recover-{}", current_unix_seconds()),
+            run_id: &run_id,
             mode: "recover",
             status: "running",
         })
@@ -131,6 +140,7 @@ pub(crate) async fn recover_report(
         recovery_sites,
         recovery_scan_days: config.runtime.recovery_scan_days,
         requested_scan_days: None,
+        repair_duplicates: args.repair_duplicates,
     })
     .await
     .context("failed to recover Jira worklog links")?;

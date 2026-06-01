@@ -54,6 +54,9 @@ pub struct RecoverArgs {
     pub paths: SharedPaths,
 
     #[arg(long)]
+    pub repair_duplicates: bool,
+
+    #[arg(long)]
     pub json: bool,
 }
 

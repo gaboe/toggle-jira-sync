@@ -90,6 +90,11 @@ pub struct ExportConfigResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogFileResult {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JiraSiteSnapshot {
     pub key: String,
     pub base_url: String,
@@ -353,6 +358,46 @@ pub fn export_config(paths: SharedPaths) -> anyhow::Result<ExportConfigResult> {
     export_config_to_dir(config_path, downloads)
 }
 
+pub fn log_file() -> anyhow::Result<LogFileResult> {
+    let path = log_file_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create log directory {}", parent.display()))?;
+    }
+    if !path.exists() {
+        fs::write(&path, "")
+            .with_context(|| format!("failed to create log file {}", path.display()))?;
+    }
+    Ok(LogFileResult {
+        path: path.display().to_string(),
+    })
+}
+
+pub fn append_log(message: &str) {
+    if let Ok(path) = log_file_path() {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let line = format!("{} {message}\n", crate::time::current_rfc3339_utc());
+        let _ = append_log_line(&path, &line);
+    }
+}
+
+fn log_file_path() -> anyhow::Result<PathBuf> {
+    if cfg!(target_os = "macos") {
+        let home = env::var_os("HOME").context("HOME must be set to resolve log path")?;
+        return Ok(PathBuf::from(home).join("Library/Logs/Toggl Jira Sync/toggl-jira-sync.log"));
+    }
+    let home = env::var_os("HOME").context("HOME must be set to resolve log path")?;
+    Ok(PathBuf::from(home).join(".local/state/toggl-jira-sync/app.log"))
+}
+
+fn append_log_line(path: &PathBuf, line: &str) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(line.as_bytes())
+}
+
 fn export_config_to_dir(
     config_path: PathBuf,
     downloads: PathBuf,
@@ -515,8 +560,20 @@ fn upsert_secret(
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return false;
     };
+    if is_placeholder_secret(value) {
+        return false;
+    }
     credentials.insert(name.to_owned(), value.to_owned());
     true
+}
+
+fn is_placeholder_secret(value: &str) -> bool {
+    matches!(
+        value,
+        "secret-token"
+            | "replace-with-your-toggl-token"
+            | "form.toggl_api_token_value.value.trim()"
+    )
 }
 
 fn default_credentials_path() -> anyhow::Result<PathBuf> {
@@ -824,6 +881,62 @@ api_token_env = "ACME_JIRA_API_TOKEN"
             Some("jira-secret")
         );
         assert!(credentials_path.exists());
+    }
+
+    #[test]
+    fn save_config_does_not_overwrite_existing_credentials_with_placeholders() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let credentials_path = dir.path().join("credentials.env");
+        fs::write(
+            &credentials_path,
+            "TOGGL_API_TOKEN=real-token\nACME_JIRA_EMAIL=dev@example.com\nACME_JIRA_API_TOKEN=real-jira-token\n",
+        )
+        .expect("write credentials");
+
+        let snapshot = save_config_with_credentials(
+            SharedPaths {
+                config: Some(config_path.clone()),
+                db: None,
+            },
+            ConfigUpdate {
+                toggl_workspace_id: 123,
+                toggl_api_token_env: "TOGGL_API_TOKEN".to_owned(),
+                toggl_api_token_value: Some("secret-token".to_owned()),
+                sqlite_path: "ledger.sqlite".to_owned(),
+                initial_backfill_from_month: None,
+                initial_backfill_days: 90,
+                recovery_from_month: None,
+                recovery_scan_days: 180,
+                schedule_enabled: true,
+                schedule_interval_minutes: 60,
+                jira_sites: vec![JiraSiteUpdate {
+                    key: "acme".to_owned(),
+                    base_url: "https://acme.atlassian.net".to_owned(),
+                    email_env: "ACME_JIRA_EMAIL".to_owned(),
+                    api_token_env: "ACME_JIRA_API_TOKEN".to_owned(),
+                    email_value: Some("dev@example.com".to_owned()),
+                    api_token_value: Some("form.toggl_api_token_value.value.trim()".to_owned()),
+                    enabled: true,
+                }],
+            },
+            Some(credentials_path.clone()),
+        )
+        .expect("save config");
+
+        assert_eq!(
+            snapshot.toggl_api_token_value.as_deref(),
+            Some("real-token")
+        );
+        assert_eq!(
+            snapshot.jira_sites[0].api_token_value.as_deref(),
+            Some("real-jira-token")
+        );
+        let credentials = fs::read_to_string(credentials_path).expect("credentials");
+        assert!(credentials.contains("TOGGL_API_TOKEN=real-token"));
+        assert!(credentials.contains("ACME_JIRA_API_TOKEN=real-jira-token"));
+        assert!(!credentials.contains("TOGGL_API_TOKEN=secret-token"));
+        assert!(!credentials.contains("form.toggl_api_token_value.value.trim()"));
     }
 
     #[test]

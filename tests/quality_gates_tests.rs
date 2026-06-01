@@ -26,6 +26,7 @@ fn config_example_parses_and_uses_env_var_placeholders_only() {
     assert_eq!(config.rate_limits.toggl_max_rps, 1.0);
     assert_eq!(config.rate_limits.jira_global_write_delay_ms, 150);
     assert_eq!(config.rate_limits.jira_same_issue_write_delay_ms, 2000);
+    assert_eq!(config.rate_limits.jira_max_parallel_groups, 4);
     assert_eq!(config.enabled_jira_sites().len(), 2);
 
     for forbidden_literal in ["@", "secret", "password"] {

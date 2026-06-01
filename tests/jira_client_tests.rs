@@ -493,6 +493,7 @@ async fn jira_client_enforces_global_and_same_issue_write_pacing() {
     let pacing = JiraWritePacing {
         global_write_delay: Duration::from_millis(50),
         same_issue_write_delay: Duration::from_millis(200),
+        ..JiraWritePacing::default()
     };
     for (issue_key, worklog_id) in [(ISSUE_KEY, WORKLOG_ID), ("SAB-456", "10002")] {
         server.mock(|when, then| {
@@ -541,6 +542,7 @@ async fn jira_client_enforces_same_issue_pacing_for_interleaved_writes() {
     let pacing = JiraWritePacing {
         global_write_delay: Duration::from_millis(50),
         same_issue_write_delay: Duration::from_millis(200),
+        ..JiraWritePacing::default()
     };
     for (issue_key, worklog_id) in [(ISSUE_KEY, WORKLOG_ID), ("SAB-456", "10002")] {
         server.mock(|when, then| {
@@ -585,6 +587,7 @@ async fn jira_client_shares_global_pacing_across_clients_in_one_sync_scope() {
     let pacing = JiraWritePacing {
         global_write_delay: Duration::from_millis(50),
         same_issue_write_delay: Duration::from_millis(200),
+        ..JiraWritePacing::default()
     };
     let scope = JiraWritePacingScope::default();
     first_server.mock(|when, then| {

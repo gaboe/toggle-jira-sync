@@ -10,6 +10,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         2,
         include_str!("../../migrations/002_jira_issue_site_cache.sql"),
     ),
+    (3, include_str!("../../migrations/003_adopted_status.sql")),
 ];
 const DEFAULT_STALE_LOCK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SYNC_LOCK_NAME: &str = "sync";
@@ -139,6 +140,43 @@ pub struct StoredStatusEntry {
     pub worklog_id: Option<String>,
     pub status: String,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRetryableTogglEntry {
+    pub workspace: String,
+    pub entry: String,
+    pub description: Option<String>,
+    pub rounded_duration_seconds: i64,
+    pub started_at: String,
+    pub stopped_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPendingLocalTogglEntry {
+    pub workspace: String,
+    pub entry: String,
+    pub description: Option<String>,
+    pub rounded_duration_seconds: i64,
+    pub started_at: String,
+    pub stopped_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredLinkedLocalTogglEntry {
+    pub workspace: String,
+    pub entry: String,
+    pub description: Option<String>,
+    pub rounded_duration_seconds: i64,
+    pub started_at: String,
+    pub stopped_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOpenTogglEntry {
+    pub workspace: String,
+    pub entry: String,
+    pub started_at: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -484,7 +522,7 @@ impl Database {
                 COALESCE(link.jira_worklog_id, latest_attempt.jira_worklog_id) AS worklog_id,
                 CASE
                     WHEN latest_attempt.status = 'error' OR entry.status = 'error' OR link.status = 'error' THEN 'error'
-                    WHEN link.jira_worklog_id IS NOT NULL AND link.status IN ('created', 'updated') THEN 'synced'
+                    WHEN link.jira_worklog_id IS NOT NULL AND link.status IN ('created', 'updated', 'adopted') THEN 'synced'
                     WHEN entry.extracted_issue_key IS NULL THEN 'skipped'
                     WHEN entry.rounded_duration_seconds = 0 THEN 'skipped'
                     ELSE 'not_synced'
@@ -493,6 +531,7 @@ impl Database {
                     WHEN latest_attempt.status = 'error' THEN COALESCE(latest_attempt.error_message, 'last sync attempt failed')
                     WHEN entry.status = 'error' THEN 'toggl entry is marked error'
                     WHEN link.status = 'error' THEN 'jira worklog link is marked error'
+                    WHEN link.jira_worklog_id IS NOT NULL AND link.status = 'adopted' THEN 'Already written by another sync or user; linked locally without changing Jira.'
                     WHEN link.jira_worklog_id IS NOT NULL AND link.status IN ('created', 'updated') THEN NULL
                     WHEN entry.rounded_duration_seconds = 0 AND entry.stopped_at IS NULL THEN 'running entry'
                     WHEN entry.extracted_issue_key IS NULL THEN 'no valid Jira issue key found in Toggl description'
@@ -508,6 +547,14 @@ impl Database {
                 ON latest_attempt.toggl_workspace_id = entry.toggl_workspace_id
                AND latest_attempt.toggl_entry_id = entry.toggl_entry_id
               WHERE entry.deleted_at IS NULL
+                AND NOT (
+                    entry.extracted_issue_key IS NULL
+                    AND COALESCE(NULLIF(TRIM(entry.description), ''), '') = ''
+                    AND latest_attempt.id IS NULL
+                    AND link.id IS NULL
+                    AND entry.stopped_at IS NOT NULL
+                    AND entry.stopped_at < datetime('now', '-1 day')
+                )
               ORDER BY entry.started_at IS NULL, entry.started_at DESC, entry.toggl_workspace_id, entry.toggl_entry_id
               LIMIT ?1",
         )?;
@@ -525,6 +572,208 @@ impl Database {
                     worklog_id: row.get(7)?,
                     status: row.get(8)?,
                     reason: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows)
+    }
+
+    pub fn list_retryable_error_toggl_entries(
+        &self,
+        toggl_workspace_id: &str,
+    ) -> DbResult<Vec<StoredRetryableTogglEntry>> {
+        let mut statement = self.connection.prepare(
+            "WITH latest_attempt AS (
+                SELECT attempt.*
+                FROM sync_attempts attempt
+                INNER JOIN (
+                    SELECT toggl_workspace_id, toggl_entry_id, MAX(id) AS id
+                    FROM sync_attempts
+                    GROUP BY toggl_workspace_id, toggl_entry_id
+                ) latest ON latest.id = attempt.id
+             )
+             SELECT
+                entry.toggl_workspace_id,
+                entry.toggl_entry_id,
+                entry.description,
+                entry.rounded_duration_seconds,
+                entry.started_at,
+                entry.stopped_at
+               FROM toggl_entries entry
+               LEFT JOIN latest_attempt
+                 ON latest_attempt.toggl_workspace_id = entry.toggl_workspace_id
+                AND latest_attempt.toggl_entry_id = entry.toggl_entry_id
+              WHERE entry.toggl_workspace_id = ?1
+                AND entry.deleted_at IS NULL
+                AND entry.started_at IS NOT NULL
+                AND (entry.status = 'error' OR latest_attempt.status = 'error')
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM jira_worklog_links link
+                     WHERE link.toggl_workspace_id = entry.toggl_workspace_id
+                       AND link.toggl_entry_id = entry.toggl_entry_id
+                       AND link.deleted_at IS NULL
+                       AND link.jira_worklog_id IS NOT NULL
+                )
+              ORDER BY entry.started_at DESC, entry.toggl_entry_id",
+        )?;
+
+        let rows = statement
+            .query_map([toggl_workspace_id], |row| {
+                Ok(StoredRetryableTogglEntry {
+                    workspace: row.get(0)?,
+                    entry: row.get(1)?,
+                    description: row.get(2)?,
+                    rounded_duration_seconds: row.get(3)?,
+                    started_at: row.get(4)?,
+                    stopped_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows)
+    }
+
+    pub fn list_pending_local_toggl_entries(
+        &self,
+        toggl_workspace_id: &str,
+    ) -> DbResult<Vec<StoredPendingLocalTogglEntry>> {
+        let mut statement = self.connection.prepare(
+            "WITH latest_attempt AS (
+                SELECT attempt.*
+                FROM sync_attempts attempt
+                INNER JOIN (
+                    SELECT toggl_workspace_id, toggl_entry_id, MAX(id) AS id
+                    FROM sync_attempts
+                    GROUP BY toggl_workspace_id, toggl_entry_id
+                ) latest ON latest.id = attempt.id
+             )
+             SELECT
+                entry.toggl_workspace_id,
+                entry.toggl_entry_id,
+                entry.description,
+                entry.rounded_duration_seconds,
+                entry.started_at,
+                entry.stopped_at
+               FROM toggl_entries entry
+               LEFT JOIN latest_attempt
+                 ON latest_attempt.toggl_workspace_id = entry.toggl_workspace_id
+                AND latest_attempt.toggl_entry_id = entry.toggl_entry_id
+              WHERE entry.toggl_workspace_id = ?1
+                AND entry.deleted_at IS NULL
+                AND entry.started_at IS NOT NULL
+                AND entry.stopped_at IS NOT NULL
+                AND entry.rounded_duration_seconds > 0
+                AND entry.extracted_issue_key IS NOT NULL
+                AND (
+                    entry.status = 'planned'
+                    OR latest_attempt.status IN ('planned', 'error')
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM jira_worklog_links link
+                     WHERE link.toggl_workspace_id = entry.toggl_workspace_id
+                       AND link.toggl_entry_id = entry.toggl_entry_id
+                       AND link.deleted_at IS NULL
+                       AND link.jira_worklog_id IS NOT NULL
+                )
+              ORDER BY entry.started_at DESC, entry.toggl_entry_id",
+        )?;
+
+        let rows = statement
+            .query_map([toggl_workspace_id], |row| {
+                Ok(StoredPendingLocalTogglEntry {
+                    workspace: row.get(0)?,
+                    entry: row.get(1)?,
+                    description: row.get(2)?,
+                    rounded_duration_seconds: row.get(3)?,
+                    started_at: row.get(4)?,
+                    stopped_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows)
+    }
+
+    pub fn list_active_linked_local_toggl_entries_since(
+        &self,
+        toggl_workspace_id: &str,
+        started_at_since: &str,
+    ) -> DbResult<Vec<StoredLinkedLocalTogglEntry>> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                entry.toggl_workspace_id,
+                entry.toggl_entry_id,
+                entry.description,
+                entry.rounded_duration_seconds,
+                entry.started_at,
+                entry.stopped_at
+               FROM toggl_entries entry
+              WHERE entry.toggl_workspace_id = ?1
+                AND entry.deleted_at IS NULL
+                AND entry.started_at IS NOT NULL
+                AND entry.started_at >= ?2
+                AND EXISTS (
+                    SELECT 1
+                      FROM jira_worklog_links link
+                     WHERE link.toggl_workspace_id = entry.toggl_workspace_id
+                       AND link.toggl_entry_id = entry.toggl_entry_id
+                       AND link.deleted_at IS NULL
+                       AND link.jira_worklog_id IS NOT NULL
+                )
+              ORDER BY entry.started_at ASC, entry.toggl_entry_id",
+        )?;
+
+        let rows = statement
+            .query_map([toggl_workspace_id, started_at_since], |row| {
+                Ok(StoredLinkedLocalTogglEntry {
+                    workspace: row.get(0)?,
+                    entry: row.get(1)?,
+                    description: row.get(2)?,
+                    rounded_duration_seconds: row.get(3)?,
+                    started_at: row.get(4)?,
+                    stopped_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows)
+    }
+
+    pub fn count_toggl_entries(&self, toggl_workspace_id: &str) -> DbResult<usize> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*)
+               FROM toggl_entries
+              WHERE toggl_workspace_id = ?1",
+            [toggl_workspace_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    pub fn list_open_zero_duration_toggl_entries(
+        &self,
+        toggl_workspace_id: &str,
+    ) -> DbResult<Vec<StoredOpenTogglEntry>> {
+        let mut statement = self.connection.prepare(
+            "SELECT toggl_workspace_id, toggl_entry_id, started_at
+               FROM toggl_entries
+              WHERE toggl_workspace_id = ?1
+                AND deleted_at IS NULL
+                AND stopped_at IS NULL
+                AND rounded_duration_seconds = 0
+                AND started_at IS NOT NULL
+              ORDER BY started_at ASC, toggl_entry_id",
+        )?;
+
+        let rows = statement
+            .query_map([toggl_workspace_id], |row| {
+                Ok(StoredOpenTogglEntry {
+                    workspace: row.get(0)?,
+                    entry: row.get(1)?,
+                    started_at: row.get(2)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -605,6 +854,24 @@ impl Database {
             params![run.run_id, run.mode, run.status],
         )?;
         Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn finish_sync_run(
+        &self,
+        sync_run_id: i64,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> DbResult<()> {
+        self.connection.execute(
+            "UPDATE sync_runs
+             SET status = ?2,
+                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 error_message = ?3,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?1",
+            params![sync_run_id, status, error_message],
+        )?;
+        Ok(())
     }
 
     pub fn upsert_sync_cursor(&self, cursor: &NewSyncCursor<'_>) -> DbResult<()> {
@@ -702,7 +969,15 @@ impl Database {
                 source_hash,
                 status,
                 marker_source
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(toggl_workspace_id, toggl_entry_id, jira_site_key, jira_worklog_id)
+            DO UPDATE SET
+                jira_issue_key = excluded.jira_issue_key,
+                source_hash = excluded.source_hash,
+                status = excluded.status,
+                marker_source = excluded.marker_source,
+                found_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
             params![
                 finding.toggl_workspace_id,
                 finding.toggl_entry_id,
