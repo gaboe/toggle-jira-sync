@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.21
+
+- Fix Windows desktop release builds by importing the cross-platform log writer trait.
+
 ## 0.1.20
 
 - Add duplicate Jira worklog detection and explicit recovery repair for deterministic Toggl/Jira duplicates.

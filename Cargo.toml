@@ -1,6 +1,6 @@
 [package]
 name = "toggl-jira-sync"
-version = "0.1.20"
+version = "0.1.21"
 edition = "2021"
 description = "Local Toggl to Jira worklog sync CLI with SQLite state and a Ratatui status UI"
 license = "MIT"

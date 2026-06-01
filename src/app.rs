@@ -1,7 +1,4 @@
-use std::{collections::HashMap, env, fs, path::PathBuf};
-
-#[cfg(unix)]
-use std::io::Write;
+use std::{collections::HashMap, env, fs, io::Write, path::PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
