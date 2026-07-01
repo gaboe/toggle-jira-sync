@@ -333,13 +333,16 @@ fn jira_started_datetime(started: &str) -> String {
 
 pub fn extract_issue_keys(comment: &str) -> Vec<String> {
     let regex = ISSUE_KEY_REGEX.get_or_init(|| {
-        Regex::new(r"\b[A-Z][A-Z0-9]+-\d+\b").expect("issue key regex must compile")
+        Regex::new(r"\b[A-Z][A-Z0-9]+-\d+(?:\.\d+)?\b").expect("issue key regex must compile")
     });
     let mut issue_keys = Vec::new();
     let mut seen = HashSet::new();
 
     for matched in regex.find_iter(comment) {
         let issue_key = matched.as_str().to_owned();
+        if issue_key.contains('.') {
+            continue;
+        }
         if seen.insert(issue_key.clone()) {
             issue_keys.push(issue_key);
         }

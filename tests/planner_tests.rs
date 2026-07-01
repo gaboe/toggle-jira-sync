@@ -101,6 +101,21 @@ fn planner_create_uses_regex_key_extraction_rounding_and_hash_inputs() {
 }
 
 #[test]
+fn planner_ignores_section_numbers_that_look_like_issue_keys() {
+    let plan = plan_sync(input(vec![entry(
+        "900001",
+        "US-1.3: Example section title",
+    )]))
+    .expect("planner should not fail globally");
+
+    assert!(plan.mutations.is_empty());
+    assert!(matches!(
+        plan.entries[0].outcome,
+        PlannerOutcome::Skip(SkipCause::MissingIssueKey)
+    ));
+}
+
+#[test]
 fn planner_unchanged_source_hash_is_no_op() {
     let desired_hash = toggl_jira_sync::sync::planner::compute_source_hash(
         "SAB-123",
