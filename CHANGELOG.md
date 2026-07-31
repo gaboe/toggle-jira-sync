@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.25
+
+- Recover from a stale turso WAL index instead of failing every open with `short read on WAL frame` after another SQLite tool checkpointed the WAL away.
+
 ## 0.1.24
 
 - Back the local sync ledger with the Turso driver and clean up its `-wal`, `-shm`, `-tshm`, and `-journal` sidecars on local data deletion.
