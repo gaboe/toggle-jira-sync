@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.26
+
+- Follow `schedule.interval_minutes` for the in-app hourly sync instead of a hardcoded 60 minutes, including changes made while the TUI is running.
+- Update turso to 0.7.2, which serves a second reader while another process holds the local database open.
+- Align the desktop app version with the CLI crate version.
+
 ## 0.1.25
 
 - Recover from a stale turso WAL index instead of failing every open with `short read on WAL frame` after another SQLite tool checkpointed the WAL away.
