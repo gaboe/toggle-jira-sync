@@ -453,6 +453,20 @@ api_token_env = "JIRA_STATUS_TEST_TOKEN"
 
     let db = Database::open(&db_path).expect("db should open");
     db.run_migrations().expect("migrations should run");
+    // Committed by this still-open writer, never checkpointed by it. The whole app depends on
+    // a second process seeing this: the scheduled sync writes while the TUI or server is open.
+    db.upsert_toggl_entry(&NewTogglEntry {
+        toggl_workspace_id: "123",
+        toggl_entry_id: "456",
+        description: Some("SAB-456 implementation"),
+        extracted_issue_key: Some("SAB-456"),
+        source_hash: "sha256:status",
+        rounded_duration_seconds: 1800,
+        status: "planned",
+        started_at: Some("2024-05-02T03:06:40Z"),
+        stopped_at: Some("2024-05-02T03:36:40Z"),
+    })
+    .expect("toggl entry should insert");
 
     let output = Command::new(binary())
         .args([
@@ -475,6 +489,7 @@ api_token_env = "JIRA_STATUS_TEST_TOKEN"
     );
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout should be json");
-    assert_eq!(json["summary"]["total_count"], 0);
+    assert_eq!(json["summary"]["total_count"], 1, "{json}");
+    assert_eq!(json["entries"][0]["entry"], "456");
     drop(db);
 }

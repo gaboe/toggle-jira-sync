@@ -133,13 +133,53 @@ fn db_opens_after_another_tool_checkpointed_the_wal_away() {
     );
     std::fs::write(&wal, b"").expect("wal should be emptied");
 
-    // Without the recovery the open fails with "short read on WAL frame". Whatever lived only
-    // in the discarded WAL is gone, but the DB is usable again instead of permanently wedged.
+    // Without the recovery the open fails with "short read on WAL frame". The DB is usable
+    // again, but this is lossy: rows that lived only in the discarded WAL are gone, which is
+    // why open() warns and points at `recover`.
     let db = Database::open(&recovered).expect("turso should recover from a stale wal index");
     db.run_migrations()
         .expect("migrations should run after recovery");
-    db.count_rows("toggl_entries")
+    let surviving = db
+        .count_rows("toggl_entries")
         .expect("recovered db should be queryable");
+    assert!(
+        surviving < 500,
+        "recovery is lossy by nature; expected fewer than the 500 written rows, got {surviving}"
+    );
+
+    // The stale index is set aside rather than destroyed, so the prior state stays inspectable.
+    assert!(
+        std::path::Path::new(&format!("{}-tshm.stale", recovered.display())).exists(),
+        "stale wal index should be quarantined next to the db"
+    );
+}
+
+#[test]
+fn db_open_does_not_touch_sidecars_for_unrelated_failures() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("not-a-database.sqlite");
+    std::fs::write(&path, b"this is not a sqlite file at all").expect("write junk file");
+    let index = format!("{}-tshm", path.display());
+    std::fs::write(&index, b"unrelated sidecar").expect("write sidecar");
+
+    // Recovery is only for the stale-WAL-index failure. Everything else must surface as-is
+    // with the sidecars left alone.
+    let error = Database::open(&path)
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(
+        !error.contains("short read on WAL frame"),
+        "unexpected failure mode: {error}"
+    );
+    assert!(
+        std::path::Path::new(&index).exists(),
+        "sidecar of an unrelated failure must not be removed"
+    );
+    assert!(
+        !std::path::Path::new(&format!("{index}.stale")).exists(),
+        "unrelated failure must not quarantine anything"
+    );
 }
 
 #[test]

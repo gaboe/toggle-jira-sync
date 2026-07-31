@@ -75,11 +75,12 @@ async fn run_app(
 
     while !app.quit {
         // The interval can change while the TUI runs, so follow the configured value
-        // instead of the one read at startup.
+        // instead of the one read at startup. Shortening it must pull the next run in,
+        // never push an already-due one out.
         let configured_interval = sync_interval(app.schedule_interval_minutes);
         if configured_interval != interval {
             interval = configured_interval;
-            next_hourly_sync = schedule_next_sync(Instant::now(), interval);
+            next_hourly_sync = next_hourly_sync.min(schedule_next_sync(Instant::now(), interval));
         }
 
         if pending_sync
@@ -115,7 +116,12 @@ async fn run_app(
         }
 
         terminal.draw(|frame| render(frame, &mut app))?;
-        if pending_sync.is_none() && hourly_sync_due(Instant::now(), next_hourly_sync) {
+        // Toggling the schedule off must stop the in-app timer too, otherwise the TUI keeps
+        // syncing after telling the user the schedule is disabled.
+        if app.schedule_enabled
+            && pending_sync.is_none()
+            && hourly_sync_due(Instant::now(), next_hourly_sync)
+        {
             app.message = "running hourly sync...".to_owned();
             pending_sync = Some(spawn_sync_action(
                 client.clone(),

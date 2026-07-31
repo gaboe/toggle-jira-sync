@@ -341,12 +341,20 @@ pub fn save_config_with_credentials(
     // Reconcile the OS hourly job with the saved schedule so config.enabled and the
     // installed launchd/systemd/schtasks job can't drift apart. Only for the real
     // default config; tests and ad-hoc configs use explicit paths and must not touch
-    // the user's scheduler.
+    // the user's scheduler. Best effort: the config and credentials are already on disk,
+    // so reporting failure here would tell the user the save failed when it did not.
+    // `schedule install` and `schedule set` still surface scheduler errors directly.
     if uses_default_config {
-        if config.schedule.enabled {
-            schedule::install_default_job(&config_path, config.schedule.interval_minutes)?;
+        let reconciled = if config.schedule.enabled {
+            schedule::install_default_job(&config_path, config.schedule.interval_minutes)
         } else {
-            schedule::uninstall_job()?;
+            schedule::uninstall_job()
+        };
+        if let Err(error) = reconciled {
+            append_log(&format!(
+                "config saved but scheduler job reconcile failed: {}",
+                crate::format_error_chain(&error)
+            ));
         }
     }
     Ok(ConfigSnapshot::from_config(
@@ -368,13 +376,12 @@ pub fn delete_local_data(paths: SharedPaths) -> anyhow::Result<DeleteLocalDataRe
         "delete local data",
     )?;
     let mut deleted = false;
-    for path in [
-        db_path.clone(),
-        PathBuf::from(format!("{}-wal", db_path.display())),
-        PathBuf::from(format!("{}-shm", db_path.display())),
-        PathBuf::from(format!("{}-tshm", db_path.display())),
-        PathBuf::from(format!("{}-journal", db_path.display())),
-    ] {
+    // Built by appending to the path itself, not to its lossy display form, so a
+    // non-UTF-8 path cannot resolve to some other file's sidecars.
+    for suffix in ["", "-wal", "-shm", "-tshm", "-tshm.stale", "-journal"] {
+        let mut sidecar = db_path.clone().into_os_string();
+        sidecar.push(suffix);
+        let path = PathBuf::from(sidecar);
         if path.exists() {
             fs::remove_file(&path)
                 .with_context(|| format!("failed to delete local DB {}", path.display()))?;

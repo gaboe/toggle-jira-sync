@@ -31,6 +31,7 @@ pub enum DbError {
         expires_at: Option<String>,
     },
     UnknownTable(String),
+    NonUtf8Path(String),
 }
 
 impl fmt::Display for DbError {
@@ -62,6 +63,9 @@ impl fmt::Display for DbError {
                     .unwrap_or_default()
             ),
             Self::UnknownTable(table_name) => write!(formatter, "unknown DB table {table_name}"),
+            Self::NonUtf8Path(path) => {
+                write!(formatter, "local DB path is not valid UTF-8: {path}")
+            }
         }
     }
 }
@@ -72,7 +76,8 @@ impl std::error::Error for DbError {
             Self::Turso(error) => Some(error),
             Self::DuplicateJiraWorklogLink { .. }
             | Self::SyncAlreadyRunning { .. }
-            | Self::UnknownTable(_) => None,
+            | Self::UnknownTable(_)
+            | Self::NonUtf8Path(_) => None,
         }
     }
 }
@@ -241,14 +246,33 @@ pub struct SyncRunLock<'a> {
 
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> DbResult<Self> {
-        let path = path.as_ref().to_string_lossy();
-        match Self::connect(&path) {
+        let path = path.as_ref();
+        // Lossy conversion would open (and create) a different file than the caller asked for.
+        let path = path
+            .to_str()
+            .ok_or_else(|| DbError::NonUtf8Path(path.display().to_string()))?;
+        match Self::connect(path) {
             Ok(database) => Ok(database),
             Err(error) => {
-                if discard_stale_wal_index(&path) {
-                    Self::connect(&path)
-                } else {
-                    Err(error)
+                if !is_stale_wal_index_error(&error) {
+                    return Err(error);
+                }
+                match quarantine_stale_wal_index(path) {
+                    Some(quarantined) => {
+                        // Loud on purpose: the truncated WAL took uncheckpointed transactions
+                        // with it, and if those included jira_worklog_links rows the next sync
+                        // re-posts worklogs that already exist in Jira. `recover` repairs those.
+                        let warning = format!(
+                            "local DB WAL index was stale and has been set aside as {quarantined}; \
+                             transactions that were only in the discarded WAL are lost. \
+                             Run `toggl-jira-sync recover` to check Jira for duplicate worklogs."
+                        );
+                        tracing::warn!("{warning}");
+                        eprintln!("warning: {warning}");
+                        // Keep the original error if the retry fails; it is the real diagnostic.
+                        Self::connect(path).map_err(|_| error)
+                    }
+                    None => Err(error),
                 }
             }
         }
@@ -1088,29 +1112,46 @@ impl Drop for SyncRunLock<'_> {
     }
 }
 
-/// Drop a stale turso WAL index so the next open can rebuild it.
+/// Does this open failure mean the `-tshm` WAL index outlived the WAL it describes?
 ///
-/// The `-tshm` index outlives the `-wal` file, so any other SQLite tool that checkpoints
-/// and truncates the WAL leaves the index pointing at frames that no longer exist, and
-/// every later open fails with a short WAL frame read. Only safe while the WAL is empty
-/// or gone: then the index describes nothing that is not already in the main DB file.
-fn discard_stale_wal_index(path: &str) -> bool {
-    if path == ":memory:" {
+/// Only that one failure may trigger recovery. `Corrupt`, `NotAdb`, permission errors, and a
+/// transient `Busy` from another process must never reach the sidecar-removing path.
+fn is_stale_wal_index_error(error: &DbError) -> bool {
+    let DbError::Turso(error) = error else {
         return false;
+    };
+    let message = error.to_string();
+    message.contains("short read on WAL frame")
+}
+
+/// Move a stale turso WAL index aside so the next open rebuilds it, returning its new path.
+///
+/// The `-tshm` index outlives the `-wal` file, so another SQLite tool that checkpoints and
+/// truncates the WAL leaves the index pointing at frames that no longer exist, and every
+/// later open fails. Those frames are already gone by the time we get here — whatever they
+/// held is lost either way — so this trades unrecoverable transactions for a usable DB, and
+/// the caller warns about it. The index is renamed rather than deleted so the previous state
+/// can still be inspected afterwards.
+fn quarantine_stale_wal_index(path: &str) -> Option<String> {
+    if path == ":memory:" {
+        return None;
     }
+    // A non-empty WAL may still hold readable frames; leave it and the index alone.
     let wal_bytes = fs::metadata(format!("{path}-wal"))
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     if wal_bytes != 0 {
-        return false;
+        return None;
     }
     let index = format!("{path}-tshm");
-    if !Path::new(&index).exists() || fs::remove_file(&index).is_err() {
-        return false;
+    if !Path::new(&index).exists() {
+        return None;
     }
+    let quarantined = format!("{index}.stale");
+    fs::rename(&index, &quarantined).ok()?;
     let _ = fs::remove_file(format!("{path}-shm"));
     let _ = fs::remove_file(format!("{path}-wal"));
-    true
+    Some(quarantined)
 }
 
 fn new_lock_token(owner: &str) -> String {

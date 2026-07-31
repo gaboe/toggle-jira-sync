@@ -149,6 +149,16 @@ pub async fn serve_listener(
     mode: ServerMode,
     tenant_db: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    if matches!(mode, ServerMode::Single) {
+        // Best effort: a missing scheduler job must not stop the app from starting. Done here
+        // rather than in `router` so tests, which build routers directly, never install a job
+        // on the machine running them.
+        match app::ensure_schedule_installed(paths.clone()) {
+            Ok(true) => eprintln!("reinstalled missing scheduler job"),
+            Ok(false) => {}
+            Err(error) => eprintln!("failed to reinstall scheduler job: {error}"),
+        }
+    }
     axum::serve(
         listener,
         router(paths, credentials_path, limit, mode, tenant_db)?,
@@ -176,14 +186,6 @@ pub fn router(
         limit,
         tenant_store,
     });
-    if matches!(mode, ServerMode::Single) {
-        // Best effort: a missing scheduler job must not stop the app from starting.
-        match app::ensure_schedule_installed(state.paths.clone()) {
-            Ok(true) => eprintln!("reinstalled missing scheduler job"),
-            Ok(false) => {}
-            Err(error) => eprintln!("failed to reinstall scheduler job: {error}"),
-        }
-    }
     let router = Router::new().route("/healthz", get(healthz));
     let router = match mode {
         ServerMode::Single => router
