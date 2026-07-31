@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.27
+
+- Recover from a stale WAL index only for the short-WAL-frame open failure, warn that transactions left in the discarded WAL are lost, and point at `recover` for the duplicate Jira worklogs that can follow. The stale index is renamed aside instead of deleted.
+- Keep the original open error when the recovery retry fails, and reject non-UTF-8 database paths instead of silently opening a different file.
+- Install the missing scheduler job from server startup rather than router construction, so building a router never touches the scheduler.
+- Report a saved config as saved even when reconciling the OS scheduler job fails; the failure is logged instead.
+- Stop the in-app TUI sync timer when the schedule is toggled off, and let a shortened interval pull the next run in instead of postponing it.
+
 ## 0.1.26
 
 - Follow `schedule.interval_minutes` for the in-app hourly sync instead of a hardcoded 60 minutes, including changes made while the TUI is running.
