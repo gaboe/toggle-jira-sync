@@ -39,7 +39,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 tower-http = { version = "0.6.8", features = ["cors"] }
 unicode-width = "0.2.0"
-turso = { version = "0.7.0-pre.17", default-features = false }
+turso = { version = "0.7.2", default-features = false }
 
 [dev-dependencies]
 base64 = "0.22.1"

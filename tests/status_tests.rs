@@ -430,7 +430,7 @@ api_token_env = "JIRA_STATUS_TEST_TOKEN"
 }
 
 #[test]
-fn status_reports_lock_error_when_another_process_holds_turso_db() {
+fn status_reads_while_another_process_holds_turso_db() {
     let temp = TempDir::new().expect("temp dir should be created");
     let db_path = temp.path().join("ledger.sqlite");
     let config_path = temp.path().join("config.toml");
@@ -466,8 +466,15 @@ api_token_env = "JIRA_STATUS_TEST_TOKEN"
         .output()
         .expect("status command should run");
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("failed to open local DB"), "{stderr}");
-    assert!(stderr.contains("Locking error"), "{stderr}");
+    // turso 0.7.2 serves a second reader while this process still holds the DB open;
+    // 0.7.0-pre.17 failed the open with a locking error instead.
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be json");
+    assert_eq!(json["summary"]["total_count"], 0);
+    drop(db);
 }

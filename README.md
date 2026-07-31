@@ -75,7 +75,8 @@ Notes:
 - `Jira site URL` is enough; the internal site key is derived from the URL. Example: `https://sabservis.atlassian.net` becomes `sabservis`.
 - No Jira issue prefixes are configured. Jira site selection is resolved dynamically per issue and cached in SQLite.
 - The local database file is created automatically on first command that opens the DB. Existing SQLite state files are opened in place by the Turso-backed runtime.
-- Turso local state should be opened by one app process at a time. Close the TUI/server before running another command against the same DB path.
+- Another process can read the local database while the TUI or server holds it open. Concurrent sync runs are rejected by the `sync` lock in the ledger, so only one writes worklogs at a time.
+- Avoid pointing other SQLite tools at the database while the app runs. Checkpointing its WAL from outside leaves the local state usable but drops whatever had not been checkpointed yet.
 - Setup installs an hourly OS scheduler job by default. Use `tjs schedule status`, `tjs schedule set --disabled`, or `tjs schedule uninstall` to inspect or disable it.
 
 ### 3. Check the generated config
