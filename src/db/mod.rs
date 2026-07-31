@@ -1,4 +1,5 @@
 use std::fmt;
+use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -241,7 +242,20 @@ pub struct SyncRunLock<'a> {
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> DbResult<Self> {
         let path = path.as_ref().to_string_lossy();
-        let builder = turso::Builder::new_local(&path);
+        match Self::connect(&path) {
+            Ok(database) => Ok(database),
+            Err(error) => {
+                if discard_stale_wal_index(&path) {
+                    Self::connect(&path)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn connect(path: &str) -> DbResult<Self> {
+        let builder = turso::Builder::new_local(path);
         let builder = if path == ":memory:" {
             builder
         } else {
@@ -1072,6 +1086,31 @@ impl Drop for SyncRunLock<'_> {
             let _ = self.database.release_sync_lock(&self.token);
         }
     }
+}
+
+/// Drop a stale turso WAL index so the next open can rebuild it.
+///
+/// The `-tshm` index outlives the `-wal` file, so any other SQLite tool that checkpoints
+/// and truncates the WAL leaves the index pointing at frames that no longer exist, and
+/// every later open fails with a short WAL frame read. Only safe while the WAL is empty
+/// or gone: then the index describes nothing that is not already in the main DB file.
+fn discard_stale_wal_index(path: &str) -> bool {
+    if path == ":memory:" {
+        return false;
+    }
+    let wal_bytes = fs::metadata(format!("{path}-wal"))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if wal_bytes != 0 {
+        return false;
+    }
+    let index = format!("{path}-tshm");
+    if !Path::new(&index).exists() || fs::remove_file(&index).is_err() {
+        return false;
+    }
+    let _ = fs::remove_file(format!("{path}-shm"));
+    let _ = fs::remove_file(format!("{path}-wal"));
+    true
 }
 
 fn new_lock_token(owner: &str) -> String {

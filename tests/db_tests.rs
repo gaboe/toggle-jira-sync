@@ -90,6 +90,59 @@ fn db_opens_existing_rusqlite_file() {
 }
 
 #[test]
+fn db_opens_after_another_tool_checkpointed_the_wal_away() {
+    let file = NamedTempFile::new().expect("temp sqlite file should be created");
+    let db = Database::open(file.path()).expect("turso should create the db");
+    db.run_migrations().expect("migrations should run");
+    // Enough writes that the WAL index describes many frames, the way a long-running app
+    // leaves it between checkpoints.
+    for index in 0..500 {
+        let entry_id = format!("entry-{index}");
+        let source_hash = format!("sha256:entry-{index}");
+        db.upsert_toggl_entry(&NewTogglEntry {
+            toggl_workspace_id: "workspace-1",
+            toggl_entry_id: &entry_id,
+            description: Some("CORE-1 work"),
+            extracted_issue_key: Some("CORE-1"),
+            source_hash: &source_hash,
+            rounded_duration_seconds: 1800,
+            status: "planned",
+            started_at: Some("2026-07-30T06:00:00Z"),
+            stopped_at: Some("2026-07-30T06:30:00Z"),
+        })
+        .expect("entry should upsert");
+    }
+    // Leak the handle so the WAL stays uncheckpointed, the way a killed process leaves it.
+    std::mem::forget(db);
+
+    // Copy that on-disk state to a path no live handle owns, the way a fresh process finds
+    // it after a crash, then let another SQLite tool checkpoint the WAL away.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let recovered = dir.path().join("toggl-jira-sync.sqlite");
+    for suffix in ["", "-wal", "-shm", "-tshm"] {
+        let from = format!("{}{suffix}", file.path().display());
+        if std::path::Path::new(&from).exists() {
+            std::fs::copy(&from, format!("{}{suffix}", recovered.display())).expect("copy sidecar");
+        }
+    }
+    let wal = format!("{}-wal", recovered.display());
+    let wal_bytes = std::fs::metadata(&wal).map(|meta| meta.len()).unwrap_or(0);
+    assert!(
+        wal_bytes > 0,
+        "wal should hold frames, got {wal_bytes} bytes"
+    );
+    std::fs::write(&wal, b"").expect("wal should be emptied");
+
+    // Without the recovery the open fails with "short read on WAL frame". Whatever lived only
+    // in the discarded WAL is gone, but the DB is usable again instead of permanently wedged.
+    let db = Database::open(&recovered).expect("turso should recover from a stale wal index");
+    db.run_migrations()
+        .expect("migrations should run after recovery");
+    db.count_rows("toggl_entries")
+        .expect("recovered db should be queryable");
+}
+
+#[test]
 fn db_jira_issue_site_cache_upserts_by_issue_key() {
     let (_file, db) = temp_database();
     db.run_migrations().expect("migrations should run");
