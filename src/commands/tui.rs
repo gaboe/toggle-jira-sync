@@ -362,6 +362,7 @@ pub struct TuiRow {
     pub start: String,
     pub end: String,
     pub duration: String,
+    pub duration_seconds: i64,
     pub issue: String,
     pub site: String,
     pub worklog: String,
@@ -570,6 +571,7 @@ impl TuiRow {
             start,
             end,
             duration: format_duration(entry.duration_seconds),
+            duration_seconds: entry.duration_seconds,
             issue,
             site,
             worklog,
@@ -583,7 +585,7 @@ impl TuiRow {
 
 fn render(frame: &mut Frame<'_>, app: &mut TuiApp) {
     let [header, table_area, detail, footer] = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Min(8),
         Constraint::Length(4),
         Constraint::Length(2),
@@ -619,6 +621,7 @@ fn render(frame: &mut Frame<'_>, app: &mut TuiApp) {
                 if app.schedule_enabled { "on" } else { "off" },
                 app.schedule_interval_minutes
             )),
+            Line::from(month_totals_label(app)),
         ])
         .block(Block::default().borders(Borders::ALL)),
         header,
@@ -709,6 +712,38 @@ fn render(frame: &mut Frame<'_>, app: &mut TuiApp) {
         detail,
     );
     frame.render_widget(Paragraph::new(app.message.clone()), footer);
+}
+
+/// Totals for the month of the row under the cursor, so the header follows the selection.
+fn month_totals_label(app: &TuiApp) -> String {
+    let Some(month) = app
+        .selected_row()
+        .map(|row| row.date.get(0..7).unwrap_or("-").to_owned())
+    else {
+        return "Month: - | tracked: - | logged in Jira: -".to_owned();
+    };
+
+    let (tracked, logged) = app
+        .rows
+        .iter()
+        .filter(|row| row.date.starts_with(&month))
+        .fold((0, 0), |(tracked, logged), row| {
+            (
+                tracked + row.duration_seconds,
+                logged
+                    + if row.status == "synced" {
+                        row.duration_seconds
+                    } else {
+                        0
+                    },
+            )
+        });
+
+    format!(
+        "Month: {month} | tracked: {} | logged in Jira: {}",
+        format_duration(tracked),
+        format_duration(logged)
+    )
 }
 
 fn status_span(status: &str) -> Span<'static> {
@@ -814,6 +849,26 @@ mod tests {
         assert_eq!(
             selected.worklog_url.as_deref(),
             Some("https://sabservis.atlassian.net/browse/CORE-223?focusedWorklogId=26410")
+        );
+    }
+
+    #[test]
+    fn tui_sums_month_totals_for_selected_row() {
+        let mut app = TuiApp::new(
+            vec![
+                row(Some("CORE-223"), "2026-05-04T15:59:00Z", "synced", None),
+                row(Some("CORE-202"), "2026-05-03T10:05:00Z", "not_synced", None),
+                row(Some("CORE-202"), "2026-04-30T10:05:00Z", "synced", None),
+            ],
+            HashMap::new(),
+            true,
+            60,
+        );
+        app.apply_filters();
+
+        assert_eq!(
+            month_totals_label(&app),
+            "Month: 2026-05 | tracked: 3h 28m | logged in Jira: 1h 44m"
         );
     }
 

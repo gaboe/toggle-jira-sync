@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.28
+
+- Show the tracked and Jira-logged hours for the selected row's month in the TUI header.
+
 ## 0.1.27
 
 - Recover from a stale WAL index only for the short-WAL-frame open failure, warn that transactions left in the discarded WAL are lost, and point at `recover` for the duplicate Jira worklogs that can follow. The stale index is renamed aside instead of deleted.
