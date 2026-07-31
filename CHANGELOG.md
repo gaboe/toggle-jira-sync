@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.24
+
+- Back the local sync ledger with the Turso driver and clean up its `-wal`, `-shm`, `-tshm`, and `-journal` sidecars on local data deletion.
+- Reinstall a missing OS scheduler job on startup so `schedule.enabled = true` can no longer drift into nothing being scheduled.
+- Reconcile the OS scheduler job whenever the default config is saved.
+
+## 0.1.23
+
+- Ignore section numbers when extracting Jira issue keys from Toggl descriptions.
+
 ## 0.1.22
 
 - Make dashboard metrics follow the selected calendar month and default to the current month on app start.
