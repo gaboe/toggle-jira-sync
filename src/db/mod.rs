@@ -2,7 +2,8 @@ use std::fmt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use rusqlite::{params, params_from_iter, Connection, ErrorCode, OptionalExtension};
+use futures::executor::block_on;
+use turso::{params, params_from_iter, Connection, IntoParams, Row, Value};
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../../migrations/001_sync_ledger.sql")),
@@ -17,7 +18,7 @@ const SYNC_LOCK_NAME: &str = "sync";
 
 #[derive(Debug)]
 pub enum DbError {
-    Sqlite(rusqlite::Error),
+    Turso(turso::Error),
     DuplicateJiraWorklogLink {
         toggl_workspace_id: String,
         toggl_entry_id: String,
@@ -34,7 +35,7 @@ pub enum DbError {
 impl fmt::Display for DbError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Sqlite(error) => write!(formatter, "sqlite error: {error}"),
+            Self::Turso(error) => write!(formatter, "turso error: {error}"),
             Self::DuplicateJiraWorklogLink {
                 toggl_workspace_id,
                 toggl_entry_id,
@@ -67,7 +68,7 @@ impl fmt::Display for DbError {
 impl std::error::Error for DbError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Sqlite(error) => Some(error),
+            Self::Turso(error) => Some(error),
             Self::DuplicateJiraWorklogLink { .. }
             | Self::SyncAlreadyRunning { .. }
             | Self::UnknownTable(_) => None,
@@ -75,9 +76,9 @@ impl std::error::Error for DbError {
     }
 }
 
-impl From<rusqlite::Error> for DbError {
-    fn from(error: rusqlite::Error) -> Self {
-        Self::Sqlite(error)
+impl From<turso::Error> for DbError {
+    fn from(error: turso::Error) -> Self {
+        Self::Turso(error)
     }
 }
 
@@ -239,31 +240,42 @@ pub struct SyncRunLock<'a> {
 
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> DbResult<Self> {
-        let connection = Connection::open(path)?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
+        let path = path.as_ref().to_string_lossy();
+        let builder = turso::Builder::new_local(&path);
+        let builder = if path == ":memory:" {
+            builder
+        } else {
+            builder.experimental_multiprocess_wal(true)
+        };
+        let db = block_on(builder.build())?;
+        let connection = db.connect()?;
+        block_on(connection.execute("PRAGMA foreign_keys = ON", ()))?;
         connection.busy_timeout(Duration::from_secs(5))?;
         Ok(Self { connection })
     }
 
     pub fn run_migrations(&self) -> DbResult<()> {
-        self.connection.execute_batch(
+        block_on(self.connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             );",
-        )?;
+        ))?;
 
         for (version, sql) in MIGRATIONS {
-            let already_applied: bool = self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
-                [version],
-                |row| row.get(0),
-            )?;
+            let already_applied: bool = self
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+                    (*version,),
+                )?
+                .map(|row| row_bool(&row, 0))
+                .transpose()?
+                .unwrap_or(false);
 
             if !already_applied {
-                self.connection.execute_batch(&format!(
+                block_on(self.connection.execute_batch(format!(
                     "BEGIN IMMEDIATE;\n{sql}\nINSERT OR IGNORE INTO schema_migrations (version) VALUES ({version});\nCOMMIT;"
-                ))?;
+                )))?;
             }
         }
 
@@ -271,20 +283,22 @@ impl Database {
     }
 
     pub fn table_names(&self) -> DbResult<Vec<String>> {
-        let mut statement = self.connection.prepare(
+        let rows = self.query_all(
             "SELECT name FROM sqlite_schema
              WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
              ORDER BY name",
+            (),
         )?;
-        let tables = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let tables = rows
+            .iter()
+            .map(|row| row_string(row, 0))
+            .collect::<DbResult<Vec<_>>>()?;
 
         Ok(tables)
     }
 
     pub fn insert_jira_worklog_link(&self, link: &NewJiraWorklogLink<'_>) -> DbResult<()> {
-        let result = self.connection.execute(
+        let result = self.execute(
             "INSERT INTO jira_worklog_links (
                 toggl_workspace_id,
                 toggl_entry_id,
@@ -317,12 +331,12 @@ impl Database {
                     jira_site_key: link.jira_site_key.to_owned(),
                 })
             }
-            Err(error) => Err(DbError::Sqlite(error)),
+            Err(error) => Err(error),
         }
     }
 
     pub fn upsert_jira_worklog_link(&self, link: &NewJiraWorklogLink<'_>) -> DbResult<()> {
-        self.connection.execute(
+        self.execute(
             "INSERT INTO jira_worklog_links (
                 toggl_workspace_id,
                 toggl_entry_id,
@@ -380,9 +394,8 @@ impl Database {
         toggl_entry_id: &str,
         jira_site_key: &str,
     ) -> DbResult<Option<StoredJiraWorklogLink>> {
-        self.connection
-            .query_row(
-                "SELECT
+        self.query_one(
+            "SELECT
                     toggl_workspace_id,
                     toggl_entry_id,
                     jira_site_key,
@@ -396,26 +409,13 @@ impl Database {
                    AND toggl_entry_id = ?2
                    AND jira_site_key = ?3
                    AND deleted_at IS NULL",
-                params![toggl_workspace_id, toggl_entry_id, jira_site_key],
-                |row| {
-                    Ok(StoredJiraWorklogLink {
-                        toggl_workspace_id: row.get(0)?,
-                        toggl_entry_id: row.get(1)?,
-                        jira_site_key: row.get(2)?,
-                        jira_issue_key: row.get(3)?,
-                        jira_worklog_id: row.get(4)?,
-                        source_hash: row.get(5)?,
-                        rounded_duration_seconds: row.get(6)?,
-                        status: row.get(7)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(DbError::Sqlite)
+            params![toggl_workspace_id, toggl_entry_id, jira_site_key],
+        )
+        .and_then(|row| row.map(|row| jira_worklog_link_from_row(&row)).transpose())
     }
 
     pub fn list_active_jira_worklog_links(&self) -> DbResult<Vec<StoredJiraWorklogLink>> {
-        let mut statement = self.connection.prepare(
+        let rows = self.query_all(
             "SELECT
                 toggl_workspace_id,
                 toggl_entry_id,
@@ -429,22 +429,13 @@ impl Database {
              WHERE deleted_at IS NULL
                AND jira_worklog_id IS NOT NULL
              ORDER BY toggl_workspace_id, toggl_entry_id, jira_site_key",
+            (),
         )?;
 
-        let links = statement
-            .query_map([], |row| {
-                Ok(StoredJiraWorklogLink {
-                    toggl_workspace_id: row.get(0)?,
-                    toggl_entry_id: row.get(1)?,
-                    jira_site_key: row.get(2)?,
-                    jira_issue_key: row.get(3)?,
-                    jira_worklog_id: row.get(4)?,
-                    source_hash: row.get(5)?,
-                    rounded_duration_seconds: row.get(6)?,
-                    status: row.get(7)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let links = rows
+            .iter()
+            .map(jira_worklog_link_from_row)
+            .collect::<DbResult<Vec<_>>>()?;
 
         Ok(links)
     }
@@ -453,28 +444,20 @@ impl Database {
         &self,
         issue_key: &str,
     ) -> DbResult<Option<StoredJiraIssueSiteCache>> {
-        self.connection
-            .query_row(
-                "SELECT issue_key, jira_site_key, discovered_at, confirmed_at, source
+        self.query_one(
+            "SELECT issue_key, jira_site_key, discovered_at, confirmed_at, source
                  FROM jira_issue_site_cache
                  WHERE issue_key = ?1",
-                [issue_key],
-                |row| {
-                    Ok(StoredJiraIssueSiteCache {
-                        issue_key: row.get(0)?,
-                        jira_site_key: row.get(1)?,
-                        discovered_at: row.get(2)?,
-                        confirmed_at: row.get(3)?,
-                        source: row.get(4)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(DbError::Sqlite)
+            (issue_key,),
+        )
+        .and_then(|row| {
+            row.map(|row| jira_issue_site_cache_from_row(&row))
+                .transpose()
+        })
     }
 
     pub fn upsert_jira_issue_site_cache(&self, cache: &NewJiraIssueSiteCache<'_>) -> DbResult<()> {
-        self.connection.execute(
+        self.execute(
             "INSERT INTO jira_issue_site_cache (
                 issue_key,
                 jira_site_key,
@@ -501,7 +484,7 @@ impl Database {
     }
 
     pub fn list_status_entries(&self, limit: usize) -> DbResult<Vec<StoredStatusEntry>> {
-        let mut statement = self.connection.prepare(
+        let rows = self.query_all(
             "WITH latest_attempt AS (
                 SELECT attempt.*
                 FROM sync_attempts attempt
@@ -557,24 +540,12 @@ impl Database {
                 )
               ORDER BY entry.started_at IS NULL, entry.started_at DESC, entry.toggl_workspace_id, entry.toggl_entry_id
               LIMIT ?1",
+            (limit as i64,),
         )?;
-
-        let rows = statement
-            .query_map([limit as i64], |row| {
-                Ok(StoredStatusEntry {
-                    workspace: row.get(0)?,
-                    entry: row.get(1)?,
-                    started_at: row.get(2)?,
-                    stopped_at: row.get(3)?,
-                    rounded_duration_seconds: row.get(4)?,
-                    issue_key: row.get(5)?,
-                    site: row.get(6)?,
-                    worklog_id: row.get(7)?,
-                    status: row.get(8)?,
-                    reason: row.get(9)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = rows
+            .iter()
+            .map(status_entry_from_row)
+            .collect::<DbResult<Vec<_>>>()?;
 
         Ok(rows)
     }
@@ -583,7 +554,7 @@ impl Database {
         &self,
         toggl_workspace_id: &str,
     ) -> DbResult<Vec<StoredRetryableTogglEntry>> {
-        let mut statement = self.connection.prepare(
+        let rows = self.query_all(
             "WITH latest_attempt AS (
                 SELECT attempt.*
                 FROM sync_attempts attempt
@@ -617,20 +588,12 @@ impl Database {
                        AND link.jira_worklog_id IS NOT NULL
                 )
               ORDER BY entry.started_at DESC, entry.toggl_entry_id",
+            (toggl_workspace_id,),
         )?;
-
-        let rows = statement
-            .query_map([toggl_workspace_id], |row| {
-                Ok(StoredRetryableTogglEntry {
-                    workspace: row.get(0)?,
-                    entry: row.get(1)?,
-                    description: row.get(2)?,
-                    rounded_duration_seconds: row.get(3)?,
-                    started_at: row.get(4)?,
-                    stopped_at: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = rows
+            .iter()
+            .map(retryable_toggl_entry_from_row)
+            .collect::<DbResult<Vec<_>>>()?;
 
         Ok(rows)
     }
@@ -639,7 +602,7 @@ impl Database {
         &self,
         toggl_workspace_id: &str,
     ) -> DbResult<Vec<StoredPendingLocalTogglEntry>> {
-        let mut statement = self.connection.prepare(
+        let rows = self.query_all(
             "WITH latest_attempt AS (
                 SELECT attempt.*
                 FROM sync_attempts attempt
@@ -679,20 +642,12 @@ impl Database {
                        AND link.jira_worklog_id IS NOT NULL
                 )
               ORDER BY entry.started_at DESC, entry.toggl_entry_id",
+            (toggl_workspace_id,),
         )?;
-
-        let rows = statement
-            .query_map([toggl_workspace_id], |row| {
-                Ok(StoredPendingLocalTogglEntry {
-                    workspace: row.get(0)?,
-                    entry: row.get(1)?,
-                    description: row.get(2)?,
-                    rounded_duration_seconds: row.get(3)?,
-                    started_at: row.get(4)?,
-                    stopped_at: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = rows
+            .iter()
+            .map(pending_toggl_entry_from_row)
+            .collect::<DbResult<Vec<_>>>()?;
 
         Ok(rows)
     }
@@ -702,7 +657,7 @@ impl Database {
         toggl_workspace_id: &str,
         started_at_since: &str,
     ) -> DbResult<Vec<StoredLinkedLocalTogglEntry>> {
-        let mut statement = self.connection.prepare(
+        let rows = self.query_all(
             "SELECT
                 entry.toggl_workspace_id,
                 entry.toggl_entry_id,
@@ -724,32 +679,27 @@ impl Database {
                        AND link.jira_worklog_id IS NOT NULL
                 )
               ORDER BY entry.started_at ASC, entry.toggl_entry_id",
+            params![toggl_workspace_id, started_at_since],
         )?;
-
-        let rows = statement
-            .query_map([toggl_workspace_id, started_at_since], |row| {
-                Ok(StoredLinkedLocalTogglEntry {
-                    workspace: row.get(0)?,
-                    entry: row.get(1)?,
-                    description: row.get(2)?,
-                    rounded_duration_seconds: row.get(3)?,
-                    started_at: row.get(4)?,
-                    stopped_at: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = rows
+            .iter()
+            .map(linked_toggl_entry_from_row)
+            .collect::<DbResult<Vec<_>>>()?;
 
         Ok(rows)
     }
 
     pub fn count_toggl_entries(&self, toggl_workspace_id: &str) -> DbResult<usize> {
-        let count: i64 = self.connection.query_row(
-            "SELECT COUNT(*)
+        let count = self
+            .query_one(
+                "SELECT COUNT(*)
                FROM toggl_entries
               WHERE toggl_workspace_id = ?1",
-            [toggl_workspace_id],
-            |row| row.get(0),
-        )?;
+                (toggl_workspace_id,),
+            )?
+            .map(|row| row_i64(&row, 0))
+            .transpose()?
+            .unwrap_or(0);
         Ok(count as usize)
     }
 
@@ -757,7 +707,7 @@ impl Database {
         &self,
         toggl_workspace_id: &str,
     ) -> DbResult<Vec<StoredOpenTogglEntry>> {
-        let mut statement = self.connection.prepare(
+        let rows = self.query_all(
             "SELECT toggl_workspace_id, toggl_entry_id, started_at
                FROM toggl_entries
               WHERE toggl_workspace_id = ?1
@@ -766,17 +716,12 @@ impl Database {
                 AND rounded_duration_seconds = 0
                 AND started_at IS NOT NULL
               ORDER BY started_at ASC, toggl_entry_id",
+            (toggl_workspace_id,),
         )?;
-
-        let rows = statement
-            .query_map([toggl_workspace_id], |row| {
-                Ok(StoredOpenTogglEntry {
-                    workspace: row.get(0)?,
-                    entry: row.get(1)?,
-                    started_at: row.get(2)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = rows
+            .iter()
+            .map(open_toggl_entry_from_row)
+            .collect::<DbResult<Vec<_>>>()?;
 
         Ok(rows)
     }
@@ -808,7 +753,8 @@ impl Database {
             .chain(std::iter::once(started_at_since.to_owned()))
             .chain(seen_entry_ids.iter().cloned())
             .collect::<Vec<_>>();
-        Ok(self.connection.execute(&sql, params_from_iter(params))?)
+        self.execute(&sql, params_from_iter(params))
+            .map(|updated| updated as usize)
     }
 
     pub fn mark_toggl_entry_deleted(
@@ -816,7 +762,7 @@ impl Database {
         toggl_workspace_id: &str,
         toggl_entry_id: &str,
     ) -> DbResult<()> {
-        self.connection.execute(
+        self.execute(
             "UPDATE toggl_entries
              SET status = 'deleted',
                  deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
@@ -834,7 +780,7 @@ impl Database {
         toggl_entry_id: &str,
         jira_site_key: &str,
     ) -> DbResult<()> {
-        self.connection.execute(
+        self.execute(
             "UPDATE jira_worklog_links
              SET status = 'deleted',
                  deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
@@ -849,7 +795,7 @@ impl Database {
     }
 
     pub fn insert_sync_run(&self, run: &NewSyncRun<'_>) -> DbResult<i64> {
-        self.connection.execute(
+        self.execute(
             "INSERT INTO sync_runs (run_id, mode, status) VALUES (?1, ?2, ?3)",
             params![run.run_id, run.mode, run.status],
         )?;
@@ -862,7 +808,7 @@ impl Database {
         status: &str,
         error_message: Option<&str>,
     ) -> DbResult<()> {
-        self.connection.execute(
+        self.execute(
             "UPDATE sync_runs
              SET status = ?2,
                  finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
@@ -875,7 +821,7 @@ impl Database {
     }
 
     pub fn upsert_sync_cursor(&self, cursor: &NewSyncCursor<'_>) -> DbResult<()> {
-        self.connection.execute(
+        self.execute(
             "INSERT INTO sync_cursors (
                 toggl_workspace_id,
                 last_toggl_since,
@@ -895,7 +841,7 @@ impl Database {
     }
 
     pub fn upsert_toggl_entry(&self, entry: &NewTogglEntry<'_>) -> DbResult<()> {
-        self.connection.execute(
+        self.execute(
             "INSERT INTO toggl_entries (
                 toggl_workspace_id,
                 toggl_entry_id,
@@ -933,7 +879,7 @@ impl Database {
     }
 
     pub fn insert_sync_attempt(&self, attempt: &NewSyncAttempt<'_>) -> DbResult<i64> {
-        self.connection.execute(
+        self.execute(
             "INSERT INTO sync_attempts (
                 sync_run_id,
                 toggl_workspace_id,
@@ -959,7 +905,7 @@ impl Database {
     }
 
     pub fn insert_recovery_finding(&self, finding: &NewRecoveryFinding<'_>) -> DbResult<i64> {
-        self.connection.execute(
+        self.execute(
             "INSERT INTO recovery_findings (
                 toggl_workspace_id,
                 toggl_entry_id,
@@ -1010,7 +956,10 @@ impl Database {
         }
 
         let sql = format!("SELECT COUNT(*) FROM {table_name}");
-        Ok(self.connection.query_row(&sql, [], |row| row.get(0))?)
+        self.query_one(&sql, ())?
+            .map(|row| row_i64(&row, 0))
+            .transpose()?
+            .ok_or_else(|| DbError::Turso(turso::Error::QueryReturnedNoRows))
     }
 
     pub fn acquire_sync_lock(&self, owner: &str) -> DbResult<SyncRunLock<'_>> {
@@ -1025,13 +974,13 @@ impl Database {
         let expires_after_seconds = stale_timeout.as_secs().max(1) as i64;
         let token = new_lock_token(owner);
 
-        self.connection.execute(
+        self.execute(
             "DELETE FROM locks
              WHERE name = ?1 AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-            [SYNC_LOCK_NAME],
+            (SYNC_LOCK_NAME,),
         )?;
 
-        let inserted = self.connection.execute(
+        let inserted = self.execute(
             "INSERT OR IGNORE INTO locks (
                 name,
                 owner,
@@ -1049,7 +998,7 @@ impl Database {
                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?4 || ' seconds'),
                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             )",
-            params![SYNC_LOCK_NAME, owner, token, expires_after_seconds],
+            params![SYNC_LOCK_NAME, owner, token.as_str(), expires_after_seconds],
         )?;
 
         if inserted == 1 {
@@ -1060,31 +1009,52 @@ impl Database {
             });
         }
 
-        let existing = self.connection.query_row(
+        let existing = self.query_one(
             "SELECT owner, expires_at FROM locks WHERE name = ?1",
-            [SYNC_LOCK_NAME],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            (SYNC_LOCK_NAME,),
         );
 
         match existing {
-            Ok((owner, expires_at)) => Err(DbError::SyncAlreadyRunning {
+            Ok(Some(row)) => Err(DbError::SyncAlreadyRunning {
                 lock_name: SYNC_LOCK_NAME,
-                owner: Some(owner),
-                expires_at: Some(expires_at),
+                owner: Some(row_string(&row, 0)?),
+                expires_at: Some(row_string(&row, 1)?),
             }),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                self.acquire_sync_lock_with_timeout(owner, stale_timeout)
-            }
-            Err(error) => Err(DbError::Sqlite(error)),
+            Ok(None) => self.acquire_sync_lock_with_timeout(owner, stale_timeout),
+            Err(error) => Err(error),
         }
     }
 
     fn release_sync_lock(&self, token: &str) -> DbResult<()> {
-        self.connection.execute(
+        self.execute(
             "DELETE FROM locks WHERE name = ?1 AND token = ?2",
             params![SYNC_LOCK_NAME, token],
         )?;
         Ok(())
+    }
+
+    fn execute(&self, sql: &str, params: impl IntoParams) -> DbResult<u64> {
+        block_on(self.connection.execute(sql, params)).map_err(DbError::Turso)
+    }
+
+    fn query_one(&self, sql: &str, params: impl IntoParams) -> DbResult<Option<Row>> {
+        block_on(async {
+            let mut rows = self.connection.query(sql, params).await?;
+            rows.next().await
+        })
+        .map_err(DbError::Turso)
+    }
+
+    fn query_all(&self, sql: &str, params: impl IntoParams) -> DbResult<Vec<Row>> {
+        block_on(async {
+            let mut rows = self.connection.query(sql, params).await?;
+            let mut collected = Vec::new();
+            while let Some(row) = rows.next().await? {
+                collected.push(row);
+            }
+            Ok(collected)
+        })
+        .map_err(DbError::Turso)
     }
 }
 
@@ -1112,10 +1082,107 @@ fn new_lock_token(owner: &str) -> String {
     format!("{}:{}:{nanos}", std::process::id(), owner)
 }
 
-fn is_constraint_violation(error: &rusqlite::Error) -> bool {
-    matches!(
-        error,
-        rusqlite::Error::SqliteFailure(failure, _)
-            if failure.code == ErrorCode::ConstraintViolation
-    )
+fn is_constraint_violation(error: &DbError) -> bool {
+    matches!(error, DbError::Turso(turso::Error::Constraint(_)))
+}
+
+fn row_string(row: &Row, idx: usize) -> DbResult<String> {
+    row.get(idx).map_err(DbError::Turso)
+}
+
+fn row_optional_string(row: &Row, idx: usize) -> DbResult<Option<String>> {
+    match row.get_value(idx).map_err(DbError::Turso)? {
+        Value::Null => Ok(None),
+        Value::Text(value) => Ok(Some(value)),
+        value => Err(DbError::Turso(turso::Error::ConversionFailure(format!(
+            "expected nullable text at column {idx}, got {value:?}"
+        )))),
+    }
+}
+
+fn row_i64(row: &Row, idx: usize) -> DbResult<i64> {
+    row.get(idx).map_err(DbError::Turso)
+}
+
+fn row_bool(row: &Row, idx: usize) -> DbResult<bool> {
+    row_i64(row, idx).map(|value| value != 0)
+}
+
+fn jira_worklog_link_from_row(row: &Row) -> DbResult<StoredJiraWorklogLink> {
+    Ok(StoredJiraWorklogLink {
+        toggl_workspace_id: row_string(row, 0)?,
+        toggl_entry_id: row_string(row, 1)?,
+        jira_site_key: row_string(row, 2)?,
+        jira_issue_key: row_string(row, 3)?,
+        jira_worklog_id: row_optional_string(row, 4)?,
+        source_hash: row_string(row, 5)?,
+        rounded_duration_seconds: row_i64(row, 6)?,
+        status: row_string(row, 7)?,
+    })
+}
+
+fn jira_issue_site_cache_from_row(row: &Row) -> DbResult<StoredJiraIssueSiteCache> {
+    Ok(StoredJiraIssueSiteCache {
+        issue_key: row_string(row, 0)?,
+        jira_site_key: row_string(row, 1)?,
+        discovered_at: row_string(row, 2)?,
+        confirmed_at: row_string(row, 3)?,
+        source: row_string(row, 4)?,
+    })
+}
+
+fn status_entry_from_row(row: &Row) -> DbResult<StoredStatusEntry> {
+    Ok(StoredStatusEntry {
+        workspace: row_string(row, 0)?,
+        entry: row_string(row, 1)?,
+        started_at: row_optional_string(row, 2)?,
+        stopped_at: row_optional_string(row, 3)?,
+        rounded_duration_seconds: row_i64(row, 4)?,
+        issue_key: row_optional_string(row, 5)?,
+        site: row_optional_string(row, 6)?,
+        worklog_id: row_optional_string(row, 7)?,
+        status: row_string(row, 8)?,
+        reason: row_optional_string(row, 9)?,
+    })
+}
+
+fn retryable_toggl_entry_from_row(row: &Row) -> DbResult<StoredRetryableTogglEntry> {
+    Ok(StoredRetryableTogglEntry {
+        workspace: row_string(row, 0)?,
+        entry: row_string(row, 1)?,
+        description: row_optional_string(row, 2)?,
+        rounded_duration_seconds: row_i64(row, 3)?,
+        started_at: row_string(row, 4)?,
+        stopped_at: row_optional_string(row, 5)?,
+    })
+}
+
+fn pending_toggl_entry_from_row(row: &Row) -> DbResult<StoredPendingLocalTogglEntry> {
+    Ok(StoredPendingLocalTogglEntry {
+        workspace: row_string(row, 0)?,
+        entry: row_string(row, 1)?,
+        description: row_optional_string(row, 2)?,
+        rounded_duration_seconds: row_i64(row, 3)?,
+        started_at: row_string(row, 4)?,
+        stopped_at: row_optional_string(row, 5)?,
+    })
+}
+
+fn linked_toggl_entry_from_row(row: &Row) -> DbResult<StoredLinkedLocalTogglEntry> {
+    Ok(StoredLinkedLocalTogglEntry {
+        workspace: row_string(row, 0)?,
+        entry: row_string(row, 1)?,
+        description: row_optional_string(row, 2)?,
+        rounded_duration_seconds: row_i64(row, 3)?,
+        started_at: row_string(row, 4)?,
+        stopped_at: row_optional_string(row, 5)?,
+    })
+}
+
+fn open_toggl_entry_from_row(row: &Row) -> DbResult<StoredOpenTogglEntry> {
+    Ok(StoredOpenTogglEntry {
+        workspace: row_string(row, 0)?,
+        entry: row_string(row, 1)?,
+        started_at: row_string(row, 2)?,
+    })
 }

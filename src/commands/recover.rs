@@ -97,7 +97,7 @@ pub(crate) async fn recover_report(
     )?;
 
     let database = Database::open(&db_path)
-        .with_context(|| format!("failed to open SQLite DB {}", db_path.display()))?;
+        .with_context(|| format!("failed to open local DB {}", db_path.display()))?;
     database
         .run_migrations()
         .context("failed to run DB migrations")?;

@@ -70,6 +70,7 @@ api_token_env = "JIRA_STATUS_TEST_TOKEN"
         status: "created",
     })
     .expect("jira link should insert");
+    drop(db);
 
     let output = Command::new(binary())
         .args([
@@ -146,6 +147,7 @@ api_token_env = "JIRA_STATUS_TEST_TOKEN"
     .expect("toggl entry should insert");
     db.mark_toggl_entry_deleted("123", "deleted-entry")
         .expect("toggl entry should be marked deleted");
+    drop(db);
 
     let output = Command::new(binary())
         .args([
@@ -211,6 +213,7 @@ api_token_env = "JIRA_STATUS_TEST_TOKEN"
         stopped_at: Some("2024-05-02T04:36:40Z"),
     })
     .expect("toggl entry should insert");
+    drop(db);
 
     let output = Command::new(binary())
         .args([
@@ -288,6 +291,7 @@ api_token_env = "JIRA_STATUS_TEST_TOKEN"
         stopped_at: None,
     })
     .expect("toggl entry should insert");
+    drop(db);
 
     let output = Command::new(binary())
         .args([
@@ -340,6 +344,7 @@ api_token_env = "JIRA_STATUS_TEST_TOKEN"
 
     let db = Database::open(&db_path).expect("db should open");
     db.run_migrations().expect("migrations should run");
+    drop(db);
 
     let output = Command::new(binary())
         .args(["status", "--json"])
@@ -404,6 +409,7 @@ api_token_env = "JIRA_STATUS_TEST_TOKEN"
         stopped_at: Some("2024-05-02T03:36:40Z"),
     })
     .expect("toggl entry should insert");
+    drop(db);
 
     let output = Command::new(binary())
         .args(["status", "--json"])
@@ -421,4 +427,47 @@ api_token_env = "JIRA_STATUS_TEST_TOKEN"
         serde_json::from_slice(&output.stdout).expect("stdout should be json");
     assert_eq!(json["summary"]["total_count"], 1);
     assert_eq!(json["entries"][0]["entry"], "456");
+}
+
+#[test]
+fn status_reports_lock_error_when_another_process_holds_turso_db() {
+    let temp = TempDir::new().expect("temp dir should be created");
+    let db_path = temp.path().join("ledger.sqlite");
+    let config_path = temp.path().join("config.toml");
+
+    fs::write(
+        &config_path,
+        r#"
+[toggl]
+workspace_id = 123
+api_token_env = "TOGGL_STATUS_TEST_TOKEN"
+
+[[jira.sites]]
+key = "sabservis"
+base_url = "https://example.atlassian.net"
+email_env = "JIRA_STATUS_TEST_EMAIL"
+api_token_env = "JIRA_STATUS_TEST_TOKEN"
+"#,
+    )
+    .expect("config should be written");
+
+    let db = Database::open(&db_path).expect("db should open");
+    db.run_migrations().expect("migrations should run");
+
+    let output = Command::new(binary())
+        .args([
+            "status",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--db",
+            db_path.to_str().expect("db path should be utf8"),
+            "--json",
+        ])
+        .output()
+        .expect("status command should run");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to open local DB"), "{stderr}");
+    assert!(stderr.contains("Locking error"), "{stderr}");
 }

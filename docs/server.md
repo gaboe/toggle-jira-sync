@@ -6,7 +6,7 @@ Local clients also use this server core automatically. The Tauri desktop app sta
 
 ## Single mode
 
-Single mode is the default local mode. It uses the same config, credentials, and SQLite ledger resolution as the CLI, TUI, and desktop GUI.
+Single mode is the default local mode. It uses the same config, credentials, and Turso-backed local ledger resolution as the CLI, TUI, and desktop GUI.
 
 ```sh
 toggl-jira-sync server --mode single --host 127.0.0.1 --port 8787
@@ -24,7 +24,7 @@ Multi mode is a minimal SaaS foundation. It requires a tenant metadata SQLite da
 toggl-jira-sync server --mode multi --tenant-db ./tenants.sqlite --host 127.0.0.1 --port 8787
 ```
 
-Each tenant row points to its own config file, credentials file, and sync SQLite ledger. Tenant API tokens are stored as SHA-256 hashes. Multi mode never uses the default local config or credentials file for tenant requests. HTTP responses expose credential presence only; raw Toggl and Jira credential values are not returned by the server API.
+Each tenant row points to its own config file, credentials file, and sync local database ledger. Tenant API tokens are stored as SHA-256 hashes. Multi mode never uses the default local config or credentials file for tenant requests. HTTP responses expose credential presence only; raw Toggl and Jira credential values are not returned by the server API.
 
 Tenant routes are scoped and require `Authorization: Bearer <token>`:
 
@@ -68,6 +68,6 @@ Multi mode intentionally does not include public signup, billing, OAuth, organiz
 
 ## Deployment guardrails
 
-For Docker or customer-hosted deployments, mount config, credentials, tenant metadata, and SQLite ledgers as volumes. Do not bake credentials into the image.
+For Docker or customer-hosted deployments, mount config, credentials, tenant metadata, and local database ledgers as volumes. Do not bake credentials into the image.
 
 SQLite is acceptable for single-tenant and small self-hosted multi-tenant deployments when each tenant has a separate ledger file. If the service becomes high-concurrency or centrally hosted for many customers, move the tenant metadata and sync ledgers to PostgreSQL before adding public SaaS features.

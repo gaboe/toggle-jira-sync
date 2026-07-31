@@ -541,6 +541,7 @@ fn dry_run_retries_historical_error_entries_not_returned_by_toggl_fetch() {
             error_message: Some("old resolver error"),
         })
         .expect("seed old error attempt");
+    drop(database);
 
     let output = Command::new(binary())
         .args([
@@ -621,6 +622,7 @@ fn dry_run_plans_completed_local_entries_not_returned_by_toggl_fetch() {
             stopped_at: Some("2024-05-02T01:30:00Z"),
         })
         .expect("seed local planned entry");
+    drop(database);
 
     let output = Command::new(binary())
         .args([

@@ -39,6 +39,57 @@ fn db_migrations_create_expected_tables() {
 }
 
 #[test]
+fn db_opens_existing_rusqlite_file() {
+    let file = NamedTempFile::new().expect("temp sqlite file should be created");
+    let connection = Connection::open(file.path()).expect("legacy sqlite file should open");
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );",
+        )
+        .expect("legacy schema table should be created");
+    for (version, sql) in [
+        (1, include_str!("../migrations/001_sync_ledger.sql")),
+        (
+            2,
+            include_str!("../migrations/002_jira_issue_site_cache.sql"),
+        ),
+        (3, include_str!("../migrations/003_adopted_status.sql")),
+    ] {
+        connection
+            .execute_batch(sql)
+            .expect("legacy migration should run");
+        connection
+            .execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [version],
+            )
+            .expect("legacy migration version should insert");
+    }
+    connection
+        .execute(
+            "INSERT INTO toggl_entries (
+                toggl_workspace_id,
+                toggl_entry_id,
+                source_hash,
+                rounded_duration_seconds,
+                status
+            ) VALUES ('workspace-1', 'entry-1', 'sha256:entry', 1800, 'planned')",
+            [],
+        )
+        .expect("legacy row should insert");
+    drop(connection);
+
+    let db = Database::open(file.path()).expect("turso should open legacy sqlite file");
+    db.run_migrations()
+        .expect("turso migrations should accept legacy file");
+
+    assert_eq!(db.count_rows("toggl_entries").unwrap(), 1);
+}
+
+#[test]
 fn db_jira_issue_site_cache_upserts_by_issue_key() {
     let (_file, db) = temp_database();
     db.run_migrations().expect("migrations should run");

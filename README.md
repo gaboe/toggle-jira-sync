@@ -1,6 +1,6 @@
 # Toggl Jira Sync
 
-Local CLI for syncing Toggl time entries into Jira worklogs. It keeps sync state in a local SQLite database, so repeated runs can skip already-synced entries and recover from interrupted runs.
+Local CLI for syncing Toggl time entries into Jira worklogs. It keeps sync state in a local Turso database file, so repeated runs can skip already-synced entries and recover from interrupted runs.
 
 This is an independent community tool. It is not an official Toggl, Jira, or Atlassian product, and it is not endorsed by those companies.
 
@@ -54,7 +54,7 @@ tjs config setup
 
 - config: `~/.config/toggl-jira-sync/config.toml`
 - credentials: `~/.config/toggl-jira-sync/credentials.env`
-- SQLite path in config: `toggl-jira-sync.sqlite`
+- local database path in config: `toggl-jira-sync.sqlite`
 - OS scheduler job for hourly sync, when scheduler installation is supported by the current OS
 
 The setup prompt asks only for values that cannot be derived:
@@ -74,7 +74,8 @@ Notes:
 - If multiple workspaces are found, the CLI shows a numbered list.
 - `Jira site URL` is enough; the internal site key is derived from the URL. Example: `https://sabservis.atlassian.net` becomes `sabservis`.
 - No Jira issue prefixes are configured. Jira site selection is resolved dynamically per issue and cached in SQLite.
-- The SQLite file is created automatically on first command that opens the DB.
+- The local database file is created automatically on first command that opens the DB. Existing SQLite state files are opened in place by the Turso-backed runtime.
+- Turso local state should be opened by one app process at a time. Close the TUI/server before running another command against the same DB path.
 - Setup installs an hourly OS scheduler job by default. Use `tjs schedule status`, `tjs schedule set --disabled`, or `tjs schedule uninstall` to inspect or disable it.
 
 ### 3. Check the generated config

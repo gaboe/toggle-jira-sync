@@ -188,7 +188,7 @@ pub fn status_report(
         "status",
     )?;
     let database = Database::open(&db_path)
-        .with_context(|| format!("failed to open SQLite DB {}", db_path.display()))?;
+        .with_context(|| format!("failed to open local DB {}", db_path.display()))?;
     database
         .run_migrations()
         .context("failed to run DB migrations")?;
@@ -316,8 +316,20 @@ pub fn save_config_with_credentials(
     }
     fs::write(&config_path, contents)
         .with_context(|| format!("failed to write config {}", config_path.display()))?;
-    let allow_process_env = credentials_path.is_none() && config_path == resolve_config_path(None)?;
+    let uses_default_config = config_path == resolve_config_path(None)?;
+    let allow_process_env = credentials_path.is_none() && uses_default_config;
     let credentials = save_credentials_update(&update, credentials_path)?;
+    // Reconcile the OS hourly job with the saved schedule so config.enabled and the
+    // installed launchd/systemd/schtasks job can't drift apart. Only for the real
+    // default config; tests and ad-hoc configs use explicit paths and must not touch
+    // the user's scheduler.
+    if uses_default_config {
+        if config.schedule.enabled {
+            schedule::install_default_job(&config_path, config.schedule.interval_minutes)?;
+        } else {
+            schedule::uninstall_job()?;
+        }
+    }
     Ok(ConfigSnapshot::from_config(
         config_path,
         &config,
@@ -336,13 +348,20 @@ pub fn delete_local_data(paths: SharedPaths) -> anyhow::Result<DeleteLocalDataRe
         config.runtime.sqlite_path.as_deref(),
         "delete local data",
     )?;
-    let deleted = if db_path.exists() {
-        fs::remove_file(&db_path)
-            .with_context(|| format!("failed to delete SQLite DB {}", db_path.display()))?;
-        true
-    } else {
-        false
-    };
+    let mut deleted = false;
+    for path in [
+        db_path.clone(),
+        PathBuf::from(format!("{}-wal", db_path.display())),
+        PathBuf::from(format!("{}-shm", db_path.display())),
+        PathBuf::from(format!("{}-tshm", db_path.display())),
+        PathBuf::from(format!("{}-journal", db_path.display())),
+    ] {
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to delete local DB {}", path.display()))?;
+            deleted = true;
+        }
+    }
     Ok(DeleteLocalDataResult {
         deleted,
         path: db_path.display().to_string(),
@@ -1044,7 +1063,7 @@ api_token_env = "ACME_JIRA_API_TOKEN"
     }
 
     #[test]
-    fn delete_local_data_removes_resolved_sqlite_file_only() {
+    fn delete_local_data_removes_resolved_db_files_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
         let db_path = dir.path().join("toggl-jira-sync.sqlite");
@@ -1078,6 +1097,9 @@ api_token_env = "ACME_JIRA_API_TOKEN"
         )
         .expect("save config");
         fs::write(&db_path, "sqlite bytes").expect("write db");
+        fs::write(format!("{}-wal", db_path.display()), "wal bytes").expect("write wal");
+        fs::write(format!("{}-shm", db_path.display()), "shm bytes").expect("write shm");
+        fs::write(format!("{}-tshm", db_path.display()), "tshm bytes").expect("write tshm");
 
         let result = delete_local_data(SharedPaths {
             config: Some(config_path.clone()),
@@ -1088,6 +1110,9 @@ api_token_env = "ACME_JIRA_API_TOKEN"
         assert!(result.deleted);
         assert_eq!(result.path, db_path.display().to_string());
         assert!(!db_path.exists());
+        assert!(!db_path.with_extension("sqlite-wal").exists());
+        assert!(!db_path.with_extension("sqlite-shm").exists());
+        assert!(!db_path.with_extension("sqlite-tshm").exists());
         assert!(config_path.exists());
     }
 

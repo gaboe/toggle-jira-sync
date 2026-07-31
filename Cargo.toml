@@ -2,7 +2,7 @@
 name = "toggl-jira-sync"
 version = "0.1.23"
 edition = "2021"
-description = "Local Toggl to Jira worklog sync CLI with SQLite state and a Ratatui status UI"
+description = "Local Toggl to Jira worklog sync CLI with Turso-backed local state and a Ratatui status UI"
 license = "MIT"
 repository = "https://github.com/gaboe/toggle-jira-sync"
 readme = "README.md"
@@ -39,6 +39,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 tower-http = { version = "0.6.8", features = ["cors"] }
 unicode-width = "0.2.0"
+turso = { version = "0.7.0-pre.17", default-features = false }
 
 [dev-dependencies]
 base64 = "0.22.1"
