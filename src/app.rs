@@ -274,6 +274,25 @@ pub fn uninstall_schedule() -> anyhow::Result<()> {
     schedule::uninstall_job()
 }
 
+/// Reinstall the OS job when the config asks for a schedule but the job file is gone
+/// (manual `schedule uninstall`, wiped LaunchAgents, restored machine). Without this the
+/// two can drift apart silently and nothing syncs until the app is opened by hand.
+/// Only for the real default config; tests and ad-hoc configs use explicit paths and must
+/// not touch the user's scheduler.
+pub fn ensure_schedule_installed(paths: SharedPaths) -> anyhow::Result<bool> {
+    let config_path = resolve_config_path(paths.config)?;
+    if config_path != resolve_config_path(None)? {
+        return Ok(false);
+    }
+    let config = AppConfig::from_path(&config_path)
+        .with_context(|| format!("failed to load config {}", config_path.display()))?;
+    if !config.schedule.enabled || schedule::job_path()?.exists() {
+        return Ok(false);
+    }
+    schedule::install_default_job(&config_path, config.schedule.interval_minutes)?;
+    Ok(true)
+}
+
 pub fn update_schedule(paths: SharedPaths, enabled: bool) -> anyhow::Result<ScheduleSnapshot> {
     set_schedule(paths, None, Some(enabled))
 }

@@ -176,6 +176,14 @@ pub fn router(
         limit,
         tenant_store,
     });
+    if matches!(mode, ServerMode::Single) {
+        // Best effort: a missing scheduler job must not stop the app from starting.
+        match app::ensure_schedule_installed(state.paths.clone()) {
+            Ok(true) => eprintln!("reinstalled missing scheduler job"),
+            Ok(false) => {}
+            Err(error) => eprintln!("failed to reinstall scheduler job: {error}"),
+        }
+    }
     let router = Router::new().route("/healthz", get(healthz));
     let router = match mode {
         ServerMode::Single => router

@@ -136,6 +136,30 @@ fn schedule_install_writes_os_job_file() {
     }
 }
 
+#[test]
+fn startup_reinstalls_missing_job_for_default_config() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config_dir = temp.path().join(".config/toggl-jira-sync");
+    fs::create_dir_all(&config_dir).expect("config dir");
+    write_config(&config_dir.join("config.toml"));
+
+    let output = Command::new(binary())
+        .args(["schedule", "status"])
+        .env("HOME", temp.path())
+        .env("APPDATA", config_dir.parent().expect("appdata parent"))
+        .env("TOGGL_JIRA_SYNC_SKIP_SCHEDULER_LOAD", "1")
+        .output()
+        .expect("schedule status should run");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("job installed: true"), "{stdout}");
+}
+
 fn walk_files(path: &std::path::Path) -> Vec<String> {
     let mut files = Vec::new();
     for entry in fs::read_dir(path).expect("read dir") {
