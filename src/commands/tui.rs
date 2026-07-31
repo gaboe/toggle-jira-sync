@@ -69,11 +69,19 @@ async fn run_app(
     mut app: TuiApp,
     client: LocalApiClient,
 ) -> anyhow::Result<()> {
-    let sync_interval = Duration::from_secs(60 * 60);
-    let mut next_hourly_sync = schedule_next_sync(Instant::now(), sync_interval);
+    let mut interval = sync_interval(app.schedule_interval_minutes);
+    let mut next_hourly_sync = schedule_next_sync(Instant::now(), interval);
     let mut pending_sync: Option<PendingSync> = None;
 
     while !app.quit {
+        // The interval can change while the TUI runs, so follow the configured value
+        // instead of the one read at startup.
+        let configured_interval = sync_interval(app.schedule_interval_minutes);
+        if configured_interval != interval {
+            interval = configured_interval;
+            next_hourly_sync = schedule_next_sync(Instant::now(), interval);
+        }
+
         if pending_sync
             .as_ref()
             .is_some_and(|pending| pending.handle.is_finished())
@@ -98,7 +106,7 @@ async fn run_app(
                 Err(_) => format!("{} task panicked", pending.label),
             };
             if !pending.dry_run {
-                next_hourly_sync = schedule_next_sync(Instant::now(), sync_interval);
+                next_hourly_sync = schedule_next_sync(Instant::now(), interval);
             }
         }
 
@@ -236,6 +244,10 @@ fn sync_progress_message(pending: &PendingSync, now: Instant) -> String {
         seconds / 60,
         seconds % 60
     )
+}
+
+fn sync_interval(interval_minutes: u32) -> Duration {
+    Duration::from_secs(60 * u64::from(interval_minutes.max(1)))
 }
 
 fn schedule_next_sync(now: Instant, interval: Duration) -> Instant {
@@ -880,6 +892,14 @@ mod tests {
             next_sync + Duration::from_secs(1),
             next_sync
         ));
+    }
+
+    #[test]
+    fn sync_interval_follows_configured_minutes() {
+        assert_eq!(sync_interval(60), Duration::from_secs(60 * 60));
+        assert_eq!(sync_interval(15), Duration::from_secs(15 * 60));
+        // A zero interval would fire the sync every loop iteration.
+        assert_eq!(sync_interval(0), Duration::from_secs(60));
     }
 
     #[test]

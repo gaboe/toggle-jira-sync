@@ -654,6 +654,9 @@ fn record_toggl_entry_ledgers(
         let outcome = outcomes.get(&key);
         let fallback_issue_key = ledger_issue_key(entry, outcome.copied());
         let ledger_issue_key = issue_key.or(fallback_issue_key.as_deref());
+        // Only 'planned', 'error', and 'deleted' are ever stored here. Sync success is
+        // recorded in jira_worklog_links, which is what the status report and the pending
+        // query both read, so this column stays at 'planned' for synced entries.
         let status = match outcome {
             Some(PlannerOutcome::Error(_)) => "error",
             _ => "planned",
