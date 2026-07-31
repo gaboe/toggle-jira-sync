@@ -8,6 +8,7 @@ credentials.env
 .sisyphus/evidence/
 .agents/
 .opencode/
+.omo/
 .playwright-mcp/
 AGENTS.md
 .DS_Store
