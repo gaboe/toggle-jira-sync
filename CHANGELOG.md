@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.29
+
+- Update Rust and frontend dependencies to their latest compatible releases.
+
 ## 0.1.28
 
 - Show the tracked and Jira-logged hours for the selected row's month in the TUI header.
