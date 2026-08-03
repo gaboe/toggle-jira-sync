@@ -585,9 +585,10 @@ impl TuiRow {
 
 fn render(frame: &mut Frame<'_>, app: &mut TuiApp) {
     let [header, table_area, detail, footer] = Layout::vertical([
-        Constraint::Length(4),
+        // Three text lines plus the block borders.
+        Constraint::Length(5),
         Constraint::Min(8),
-        Constraint::Length(4),
+        Constraint::Length(5),
         Constraint::Length(2),
     ])
     .areas(frame.area());
