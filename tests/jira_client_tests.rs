@@ -657,6 +657,11 @@ async fn jira_client_maps_common_jira_errors_to_typed_errors() {
         ),
         (
             400,
+            json!({"errorMessages":["You do not have the permission to associate a worklog to this issue.", "Worklog must not be null."]}),
+            JiraError::WorklogNotAllowed,
+        ),
+        (
+            400,
             json!({"errorMessages":["Field validation failed"]}),
             JiraError::ValidationFailed(String::new()),
         ),
@@ -679,6 +684,12 @@ async fn jira_client_maps_common_jira_errors_to_typed_errors() {
             std::mem::discriminant(&actual),
             std::mem::discriminant(&expected)
         );
+        if matches!(expected, JiraError::WorklogNotAllowed) {
+            assert_eq!(
+                actual.to_string(),
+                "Jira does not allow logging time on this issue (it may be closed or you may lack permission)"
+            );
+        }
     }
 }
 

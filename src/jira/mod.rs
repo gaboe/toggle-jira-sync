@@ -111,6 +111,7 @@ pub enum JiraError {
     PermissionDenied,
     IssueNotFound,
     TimeTrackingDisabled,
+    WorklogNotAllowed,
     RateLimited {
         retry_after: Duration,
         message: String,
@@ -131,6 +132,9 @@ impl fmt::Display for JiraError {
             Self::PermissionDenied => formatter.write_str("Jira permission denied"),
             Self::IssueNotFound => formatter.write_str("Jira issue or worklog not found"),
             Self::TimeTrackingDisabled => formatter.write_str("Jira time tracking is disabled"),
+            Self::WorklogNotAllowed => formatter.write_str(
+                "Jira does not allow logging time on this issue (it may be closed or you may lack permission)",
+            ),
             Self::RateLimited {
                 retry_after,
                 message,
@@ -701,6 +705,13 @@ fn map_error_response(status: StatusCode, headers: &HeaderMap, message: String) 
         StatusCode::NOT_FOUND => JiraError::IssueNotFound,
         StatusCode::BAD_REQUEST if message.to_ascii_lowercase().contains("time tracking") => {
             JiraError::TimeTrackingDisabled
+        }
+        StatusCode::BAD_REQUEST
+            if message
+                .to_ascii_lowercase()
+                .contains("permission to associate a worklog") =>
+        {
+            JiraError::WorklogNotAllowed
         }
         StatusCode::TOO_MANY_REQUESTS => JiraError::RateLimited {
             retry_after: parse_retry_after(headers),

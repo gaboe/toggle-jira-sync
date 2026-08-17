@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.31
+
+- Show a clear Jira worklog-not-allowed error when an issue is closed or the user lacks permission, instead of exposing the raw validation response.
+
 ## 0.1.30
 
 - Give the TUI header and details blocks room for their last line, so the monthly totals and the worklog URL are no longer cut off.
