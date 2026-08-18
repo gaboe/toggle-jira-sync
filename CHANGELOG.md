@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.33
+
+- Keep the default-path config setup integration test hermetic on Linux by skipping native scheduler activation.
+
 ## 0.1.32
 
 - Add clear colleague-facing Cargo and desktop installation/setup documentation, including dry-run and persistent background-sync guidance.

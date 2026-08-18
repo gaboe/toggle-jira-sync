@@ -34,7 +34,7 @@ toggl-jira-sync
 
 ### Desktop app via GitHub Releases
 
-Download the `v0.1.32` release, or the latest release, from [GitHub Releases](https://github.com/gaboe/toggle-jira-sync/releases). Choose the macOS, Windows, or Linux asset for your machine. macOS builds include Apple Silicon and Intel assets; Linux releases include AppImage, Debian/Ubuntu, and Fedora/RHEL packages where available.
+Download the `v0.1.33` release, or the latest release, from [GitHub Releases](https://github.com/gaboe/toggle-jira-sync/releases). Choose the macOS, Windows, or Linux asset for your machine. macOS builds include Apple Silicon and Intel assets; Linux releases include AppImage, Debian/Ubuntu, and Fedora/RHEL packages where available.
 
 The desktop builds are unsigned. Your operating system may show an extra warning before the app can be opened.
 

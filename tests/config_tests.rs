@@ -425,6 +425,7 @@ fn config_setup_without_paths_uses_default_home_based_locations() {
         .args(["config", "setup"])
         .env("HOME", home_dir)
         .env("TJS_SKIP_SCHEDULE_INSTALL", "1")
+        .env("TOGGL_JIRA_SYNC_SKIP_SCHEDULER_LOAD", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
