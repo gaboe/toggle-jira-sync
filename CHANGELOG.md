@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.32
+
+- Add clear colleague-facing Cargo and desktop installation/setup documentation, including dry-run and persistent background-sync guidance.
+- Run packaged desktop scheduler invocations headlessly so OS jobs keep syncing after the GUI closes.
+- Harden scheduler lifecycle and path handling across launchd, systemd/AppImage, and Windows Task Scheduler, including visible partial-save failures and retrying failed disable cleanup.
+
 ## 0.1.31
 
 - Show a clear Jira worklog-not-allowed error when an issue is closed or the user lacks permission, instead of exposing the raw validation response.

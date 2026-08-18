@@ -1,192 +1,111 @@
 # Toggl Jira Sync
 
-Local CLI for syncing Toggl time entries into Jira worklogs. It keeps sync state in a local Turso database file, so repeated runs can skip already-synced entries and recover from interrupted runs.
+Toggl Jira Sync is an independent community tool that reads Toggl time entries, finds Jira issue keys in their descriptions, and creates or updates Jira worklogs. Sync state stays in local files so repeated runs are safe and recoverable. It is not an official Toggl, Jira, or Atlassian product.
 
-This is an independent community tool. It is not an official Toggl, Jira, or Atlassian product, and it is not endorsed by those companies.
+## Five-minute setup
 
-## Setup
+1. Choose one of the two installation paths below.
+2. Configure Toggl and every Jira site that may contain your issue keys.
+3. Test and save the credentials.
+4. Run a dry-run, review the planned changes, then run the real sync.
 
-## Installation
+## Install: choose one
 
-From crates.io:
+### CLI/TUI via Cargo
+
+Install the released command from crates.io:
 
 ```sh
 cargo install toggl-jira-sync
 ```
 
-From GitHub:
+The installed command is `toggl-jira-sync`. If you want a shorter local alias, add it yourself:
 
 ```sh
-cargo install --git https://github.com/gaboe/toggle-jira-sync
+alias tjs='toggl-jira-sync'
 ```
 
-Update an existing Cargo install:
+Run setup, then launch the terminal UI with no subcommand:
 
 ```sh
-cargo install toggl-jira-sync --force
+toggl-jira-sync config setup
+toggl-jira-sync
 ```
 
-For local development from this repository:
+### Desktop app via GitHub Releases
 
-```sh
-cargo run -- config setup
-```
+Download the `v0.1.32` release, or the latest release, from [GitHub Releases](https://github.com/gaboe/toggle-jira-sync/releases). Choose the macOS, Windows, or Linux asset for your machine. macOS builds include Apple Silicon and Intel assets; Linux releases include AppImage, Debian/Ubuntu, and Fedora/RHEL packages where available.
 
-GitHub install works directly from the repository and is useful for testing unreleased changes. The crates.io install is the recommended stable path.
+The desktop builds are unsigned. Your operating system may show an extra warning before the app can be opened.
 
-### 1. Build or run the CLI
+On macOS, move the app to `/Applications` before enabling the OS schedule so the saved executable path remains stable. For a Linux AppImage, move it to a stable location such as `~/Applications/` and keep it there before enabling the OS schedule; do not schedule an AppImage launched from a temporary mount.
 
-From this repository:
+Open the app and use **Configuration** to enter and test credentials, add Jira sites, and save. The desktop app uses the same local config, credentials, database, scheduler, and sync core as the CLI/TUI.
 
-```sh
-cargo run -- config setup
-```
+## Configure Toggl and Jira
 
-If you use the local alias:
+For Toggl, provide an API token. Interactive CLI setup discovers the workspace automatically when possible; if discovery is unavailable or finds several workspaces, enter the workspace ID. The desktop Configuration screen has the same workspace and token fields.
 
-```sh
-tjs config setup
-```
+Add one or more enabled Jira sites. For each site provide:
 
-### 2. Enter setup values
+- the base URL, such as `https://acme.atlassian.net`;
+- the Jira account email; and
+- a Jira API token.
 
-`config setup` creates:
+Use **Test Toggl credentials** and **Test Jira credentials** before saving. CLI setup writes the same values after its prompts. Credentials are kept in the local `credentials.env` file; config, credentials, and sync state remain on this machine and are not uploaded by this tool.
 
-- config: `~/.config/toggl-jira-sync/config.toml`
-- credentials: `~/.config/toggl-jira-sync/credentials.env`
-- local database path in config: `toggl-jira-sync.sqlite`
-- OS scheduler job for hourly sync, when scheduler installation is supported by the current OS
-
-The setup prompt asks only for values that cannot be derived:
+Put the Jira key in the Toggl description, for example:
 
 ```text
-Toggl API token:
-Toggl workspace id fallback, only if workspace discovery is skipped or fails
-Jira site URL:
-Jira email:
-Jira API token:
+CORE-297 implementácia
 ```
 
-Notes:
+If the description contains one Jira key, sync uses it. If it contains several keys, sync uses one only when exactly one of them resolves to an enabled Jira site; otherwise it reports `MultipleIssueKeys` and does not plan a worklog for that entry. You do not need to configure issue prefixes.
 
-- In an interactive terminal, the Toggl API token is used to discover workspaces automatically.
-- If one Toggl workspace is found, it is selected automatically.
-- If multiple workspaces are found, the CLI shows a numbered list.
-- `Jira site URL` is enough; the internal site key is derived from the URL. Example: `https://sabservis.atlassian.net` becomes `sabservis`.
-- No Jira issue prefixes are configured. Jira site selection is resolved dynamically per issue and cached in SQLite.
-- The local database file is created automatically on first command that opens the DB. Existing SQLite state files are opened in place by the Turso-backed runtime.
-- Another process can read the local database while the TUI or server holds it open. Concurrent sync runs are rejected by the `sync` lock in the ledger, so only one writes worklogs at a time.
-- Avoid pointing other SQLite tools at the database while the app runs. Checkpointing its WAL from outside leaves the local state usable but drops whatever had not been checkpointed yet.
-- Setup installs an hourly OS scheduler job by default. Use `tjs schedule status`, `tjs schedule set --disabled`, or `tjs schedule uninstall` to inspect or disable it.
+## Dry-run, review, and sync
 
-### 3. Check the generated config
+Run a preview first. It reads Toggl and Jira and shows planned creates, updates, skips, or errors without writing Jira worklogs:
 
 ```sh
-tjs config show
+toggl-jira-sync sync --dry-run
 ```
 
-Secrets are redacted by default. To inspect local secret values explicitly:
+Review the dry-run output or the desktop ledger. Then run the real sync:
 
 ```sh
-tjs config show --show-secrets
+toggl-jira-sync sync
 ```
 
-### 4. Validate config
+The TUI has the same **Dry run** and **Sync** actions. The desktop app has **Preview changes** and **Sync** actions. Running sync records local links and statuses so later runs skip unchanged worklogs.
+
+## Background sync when the app is closed
+
+Saving setup attempts to enable the persistent OS job by default at 60 minutes. When installation succeeds, it runs the real sync every 60 minutes even when the desktop window or TUI is closed. The installed job launches the same executable with `sync --cleanup-deleted --config ...`; it does not reopen the desktop GUI. Configuration and credentials remain saved if scheduler reconciliation fails, but the desktop reports that the scheduler change failed so the save is only partial. In particular, a failed disable can leave the previous native job active until removal succeeds; verify with `toggl-jira-sync schedule status` and the native scheduler status commands below, then retry removal.
+
+The platform job is:
+
+- macOS: a `launchd` user agent at `~/Library/LaunchAgents/com.toggl-jira-sync.hourly.plist`;
+- Linux: a `systemd --user` timer and service under `~/.config/systemd/user/`; and
+- Windows: a Windows Task Scheduler task named `toggl-jira-sync` (with a local helper file under `%APPDATA%`).
+
+The CLI can inspect or change the persistent job:
 
 ```sh
-tjs config validate --config ~/.config/toggl-jira-sync/config.toml
+toggl-jira-sync schedule status
+toggl-jira-sync schedule set --interval-minutes 60 --enabled
+toggl-jira-sync schedule set --disabled
+toggl-jira-sync schedule uninstall
 ```
 
-## Daily usage
+In the desktop app, change **Schedule interval minutes** and **Enable OS schedule** in Configuration, then save. `status` reports the installed job path. You can also inspect the native job with `launchctl`, `systemctl --user`, or `schtasks /Query /TN toggl-jira-sync /V`.
 
-Launch the TUI:
+This persistent OS job is separate from **Sync hourly while this app is open** in the desktop app. The latter is only an in-app timer and stops when the UI closes. The TUI’s hourly activity also ends when the TUI closes; only the OS job persists.
 
-```sh
-tjs
-```
+For a cautious first run, disable the OS job while reviewing the dry-run, run the real sync when it looks correct, then enable the job again.
 
-You can also open it explicitly:
+## Local files
 
-```sh
-tjs tui
-```
-
-The TUI shows recent local sync state from SQLite and lets you run common actions without leaving the terminal:
-
-- search and filter entries
-- open matching Jira or Toggl links
-- press `d` to run a dry-run sync
-- press `s` to run a real sync
-- press `a` to toggle the hourly OS scheduler
-
-Local day-to-day commands use the same backend HTTP server core as the GUI. `tjs`, `tjs tui`, `tjs status`, `tjs sync`, and `tjs schedule ...` start an embedded loopback server automatically for the command lifetime; you do not need to run `tjs server` separately for local use.
-
-It is the main day-to-day view:
-
-```text
-Toggl -> Jira Sync TUI  normal
-Issue search: - | Date/time filter: - | rows=3/3 | OS schedule: on every 60m
-
-date        start end   duration   issue    site     worklog status  reason
-2026-05-04 15:59 17:43 1h 44m     PROJ-123 acme     26410   synced  -
-2026-05-04 18:00 18:30 30m        PROJ-456 acme     -       skipped running entry
-2026-05-05 09:15 10:00 45m        PROJ-789 acme     -       error   issue not found
-
-Issue: PROJ-123 | Worklog: 26410 | Reason: -
-Issue URL: https://acme.atlassian.net/browse/PROJ-123
-Worklog URL: https://acme.atlassian.net/browse/PROJ-123?focusedWorklogId=26410
-```
-
-While the TUI is open, it also runs an hourly sync through the embedded local server. The OS scheduler is separate and keeps hourly sync running when the TUI is not open.
-
-Run a safe preview first:
-
-```sh
-tjs sync --dry-run
-```
-
-Run the real sync:
-
-```sh
-tjs sync
-```
-
-Inspect local sync state:
-
-```sh
-tjs status
-```
-
-Recover after an interrupted or uncertain sync:
-
-```sh
-tjs recover
-```
-
-Manage the hourly OS scheduler:
-
-```sh
-tjs schedule status
-tjs schedule set --interval-minutes 60 --enabled
-tjs schedule set --disabled
-tjs schedule uninstall
-```
-
-## How Jira site resolution works
-
-For each Toggl entry, the CLI extracts a Jira issue key from the description, for example `PROJ-123`.
-
-Resolution flow:
-
-1. Check SQLite cache for `issue_key -> jira_site_key`.
-2. If cached, use it without Jira discovery.
-3. If not cached, query every enabled Jira site with `GET /rest/api/3/issue/{issueKey}`.
-4. If exactly one site has the issue, save that mapping to SQLite.
-5. If zero or multiple sites match, report an error instead of creating a worklog on the wrong site.
-
-This means setup does not need issue prefixes.
-
-## Files created locally
+On macOS and Linux the defaults are:
 
 ```text
 ~/.config/toggl-jira-sync/config.toml
@@ -194,4 +113,50 @@ This means setup does not need issue prefixes.
 toggl-jira-sync.sqlite
 ```
 
-`credentials.env` stores raw local credentials and is written with user-only permissions on Unix/macOS.
+On Windows the config and credentials directory is `%APPDATA%\toggl-jira-sync\`. A relative SQLite path is resolved next to the config file. `credentials.env` is written with user-only permissions on Unix/macOS. Do not commit or share these files.
+
+Use explicit paths when you need a separate local profile:
+
+```sh
+toggl-jira-sync sync --config /path/to/config.toml --db /path/to/state.sqlite
+toggl-jira-sync config show --config /path/to/config.toml
+```
+
+## Jira site resolution
+
+For each Toggl entry, the sync extracts Jira issue keys from the description and:
+
+1. uses the cached `issue_key -> site` mapping when one exists;
+2. uses the only extracted key directly when there is one;
+3. when there are multiple keys, keeps only keys that resolve to an enabled site;
+4. proceeds only when exactly one key remains, otherwise reports `multiple issue keys found`; and
+5. for the chosen key, caches the site mapping when exactly one enabled site contains it.
+
+If a key is ambiguous, enable only the relevant site or correct the site configuration, then preview again.
+
+## Recovery and diagnostics
+
+Inspect local results and validate configuration with:
+
+```sh
+toggl-jira-sync status
+toggl-jira-sync config validate --config ~/.config/toggl-jira-sync/config.toml
+toggl-jira-sync doctor --online
+```
+
+If a run was interrupted or local state is uncertain, reconcile it before syncing again:
+
+```sh
+toggl-jira-sync recover
+toggl-jira-sync status
+```
+
+The sync lock rejects overlapping runs. If the local database was copied or restored while a process was using it, close the app/TUI first and run recovery. Never edit the SQLite file with another tool while a sync is active.
+
+## Help
+
+```sh
+toggl-jira-sync --help
+toggl-jira-sync sync --help
+toggl-jira-sync schedule --help
+```

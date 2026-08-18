@@ -156,7 +156,7 @@ pub async fn serve_listener(
         match app::ensure_schedule_installed(paths.clone()) {
             Ok(true) => eprintln!("reinstalled missing scheduler job"),
             Ok(false) => {}
-            Err(error) => eprintln!("failed to reinstall scheduler job: {error}"),
+            Err(error) => eprintln!("failed to reconcile scheduler job: {error}"),
         }
     }
     axum::serve(

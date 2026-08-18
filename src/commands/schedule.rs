@@ -1,6 +1,6 @@
 use std::{env, fs, path::Path, path::PathBuf};
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context};
@@ -11,7 +11,7 @@ use crate::{
     local_api::LocalServer,
 };
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 const JOB_NAME: &str = "toggl-jira-sync";
 #[cfg(target_os = "macos")]
 const MACOS_LABEL: &str = "com.toggl-jira-sync.hourly";
@@ -68,8 +68,29 @@ pub(crate) fn install_default_job(config_path: &Path, interval_minutes: u32) -> 
     if interval_minutes == 0 {
         bail!("schedule interval must be greater than 0 minutes");
     }
-    let executable = env::current_exe().context("failed to resolve current executable")?;
+    let executable = scheduler_executable()?;
     install_job(&executable, config_path, interval_minutes)
+}
+
+fn scheduler_executable() -> anyhow::Result<PathBuf> {
+    let current_exe = env::current_exe().context("failed to resolve current executable")?;
+    let appimage = env::var_os("APPIMAGE").map(PathBuf::from);
+    Ok(select_scheduler_executable(
+        &current_exe,
+        appimage.as_deref(),
+    ))
+}
+
+fn select_scheduler_executable(current_exe: &Path, appimage: Option<&Path>) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    if let Some(appimage) = appimage.filter(|path| !path.as_os_str().is_empty()) {
+        return appimage.to_owned();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = appimage;
+
+    current_exe.to_owned()
 }
 
 pub(crate) fn install_job(
@@ -80,6 +101,7 @@ pub(crate) fn install_job(
     let path = job_path()?;
     let job_file = render_job_file(executable, config_path, interval_minutes);
     if job_installation_unchanged(&path, &job_file, executable, config_path)? {
+        load_job(&path)?;
         return Ok(());
     }
     if let Some(parent) = path.parent() {
@@ -88,7 +110,6 @@ pub(crate) fn install_job(
     }
     fs::write(&path, job_file)
         .with_context(|| format!("failed to write schedule job {}", path.display()))?;
-    load_job(&path)?;
     #[cfg(target_os = "linux")]
     {
         let service_path = path.with_file_name(format!("{JOB_NAME}.service"));
@@ -103,6 +124,7 @@ pub(crate) fn install_job(
             )
         })?;
     }
+    load_job(&path)?;
     Ok(())
 }
 
@@ -128,9 +150,28 @@ fn job_installation_unchanged(
     Ok(true)
 }
 
+pub(crate) fn job_installed() -> anyhow::Result<bool> {
+    let timer_path = job_path()?;
+    #[cfg(target_os = "linux")]
+    let service_exists = timer_path
+        .with_file_name(format!("{JOB_NAME}.service"))
+        .exists();
+    #[cfg(target_os = "linux")]
+    return Ok(linux_job_files_present(timer_path.exists(), service_exists));
+
+    #[cfg(not(target_os = "linux"))]
+    Ok(timer_path.exists())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_job_files_present(timer_exists: bool, service_exists: bool) -> bool {
+    timer_exists && service_exists
+}
+
 pub(crate) fn uninstall_job() -> anyhow::Result<()> {
     let path = job_path()?;
-    if path.exists() {
+    let timer_exists = path.exists();
+    if timer_exists {
         unload_job(&path)?;
         fs::remove_file(&path)
             .with_context(|| format!("failed to remove schedule job {}", path.display()))?;
@@ -138,13 +179,17 @@ pub(crate) fn uninstall_job() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let service_path = path.with_file_name(format!("{JOB_NAME}.service"));
-        if service_path.exists() {
+        let service_exists = service_path.exists();
+        if service_exists {
             fs::remove_file(&service_path).with_context(|| {
                 format!(
                     "failed to remove schedule service {}",
                     service_path.display()
                 )
             })?;
+        }
+        if timer_exists || service_exists {
+            reload_systemd()?;
         }
     }
     Ok(())
@@ -178,10 +223,53 @@ fn load_job(_path: &Path) -> anyhow::Result<()> {
             bail!("schtasks create failed for {}", _path.display());
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        reload_systemd()?;
+
+        let output = Command::new("systemctl")
+            .args(systemd_enable_args())
+            .output()
+            .context("failed to enable toggl-jira-sync systemd timer")?;
+        if !output.status.success() {
+            bail!("systemctl --user enable --now failed for {JOB_NAME}.timer");
+        }
+    }
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn systemd_reload_args() -> [&'static str; 2] {
+    ["--user", "daemon-reload"]
+}
+
+#[cfg(target_os = "linux")]
+fn reload_systemd() -> anyhow::Result<()> {
+    let output = Command::new("systemctl")
+        .args(systemd_reload_args())
+        .output()
+        .context("failed to run systemctl --user daemon-reload")?;
+    if !output.status.success() {
+        bail!("systemctl --user daemon-reload failed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_enable_args() -> [&'static str; 4] {
+    ["--user", "enable", "--now", "toggl-jira-sync.timer"]
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_disable_args() -> [&'static str; 4] {
+    ["--user", "disable", "--now", "toggl-jira-sync.timer"]
+}
+
 fn unload_job(_path: &Path) -> anyhow::Result<()> {
+    if env::var_os("TOGGL_JIRA_SYNC_SKIP_SCHEDULER_LOAD").is_some() {
+        return Ok(());
+    }
+
     #[cfg(target_os = "macos")]
     {
         let _ = quiet_launchctl("unload", _path);
@@ -194,6 +282,16 @@ fn unload_job(_path: &Path) -> anyhow::Result<()> {
             .context("failed to run schtasks delete")?;
         if !output.status.success() && _path.exists() {
             bail!("schtasks delete failed for {JOB_NAME}");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("systemctl")
+            .args(systemd_disable_args())
+            .output()
+            .context("failed to disable toggl-jira-sync systemd timer")?;
+        if !output.status.success() {
+            bail!("systemctl --user disable --now failed for {JOB_NAME}.timer");
         }
     }
     Ok(())
@@ -335,24 +433,45 @@ fn render_systemd_timer(_executable: &Path, _config_path: &Path, interval_minute
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn render_systemd_service(executable: &Path, config_path: &Path) -> String {
     format!(
         "[Unit]\nDescription=Toggl Jira Sync\n\n[Service]\nType=oneshot\nExecStart={} sync --cleanup-deleted --config {}\n",
-        executable.display(),
-        config_path.display()
+        systemd_quote(executable),
+        systemd_quote(config_path)
     )
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "linux", test))]
+fn systemd_quote(path: &Path) -> String {
+    let mut quoted = String::from("\"");
+    for character in path.to_string_lossy().chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '$' => quoted.push_str("$$"),
+            '%' => quoted.push_str("%%"),
+            _ => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn render_windows_command(executable: &Path, config_path: &Path, interval_minutes: u32) -> String {
     format!(
         "schtasks /Create /F /SC MINUTE /MO {} /TN {} /TR \"\\\"{}\\\" sync --cleanup-deleted --config \\\"{}\\\"\"\r\n",
         interval_minutes,
         JOB_NAME,
-        executable.display(),
-        config_path.display()
+        batch_escape(&executable.to_string_lossy()),
+        batch_escape(&config_path.to_string_lossy())
     )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn batch_escape(value: &str) -> String {
+    value.replace('%', "%%")
 }
 
 #[cfg(target_os = "macos")]
@@ -395,5 +514,79 @@ enabled = true
         let config = AppConfig::from_path(temp.path()).expect("config should parse");
         assert!(!config.schedule.enabled);
         assert_eq!(config.schedule.interval_minutes, 30);
+    }
+
+    #[test]
+    fn scheduler_executable_falls_back_to_current_exe_without_appimage() {
+        let current_exe = Path::new("/tmp/.mount_tjs/toggl-jira-sync");
+
+        assert_eq!(select_scheduler_executable(current_exe, None), current_exe);
+    }
+
+    #[test]
+    fn linux_job_presence_requires_timer_and_service() {
+        assert!(!linux_job_files_present(false, false));
+        assert!(!linux_job_files_present(true, false));
+        assert!(!linux_job_files_present(false, true));
+        assert!(linux_job_files_present(true, true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn appimage_scheduler_uses_stable_appimage_path() {
+        let current_exe = Path::new("/tmp/.mount_tjs/toggl-jira-sync");
+        let appimage = Path::new("/home/me/Applications/toggl-jira-sync.AppImage");
+
+        assert_eq!(
+            select_scheduler_executable(current_exe, Some(appimage)),
+            appimage
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_install_enables_user_timer_after_reload() {
+        assert_eq!(systemd_reload_args(), ["--user", "daemon-reload"]);
+        assert_eq!(
+            systemd_enable_args(),
+            ["--user", "enable", "--now", "toggl-jira-sync.timer"]
+        );
+        assert_eq!(
+            systemd_disable_args(),
+            ["--user", "disable", "--now", "toggl-jira-sync.timer"]
+        );
+    }
+
+    #[test]
+    fn systemd_service_quotes_paths_and_systemd_expansions() {
+        let service = render_systemd_service(
+            Path::new(r#"/opt/Toggl Jira/100%/$ready/"sync"\bin"#),
+            Path::new(r#"/home/me/My Config/$daily 100%.toml"#),
+        );
+
+        assert_eq!(
+            service,
+            r#"[Unit]
+Description=Toggl Jira Sync
+
+[Service]
+Type=oneshot
+ExecStart="/opt/Toggl Jira/100%%/$$ready/\"sync\"\\bin" sync --cleanup-deleted --config "/home/me/My Config/$$daily 100%%.toml"
+"#
+        );
+    }
+
+    #[test]
+    fn windows_command_escapes_percent_in_quoted_paths() {
+        let command = render_windows_command(
+            Path::new(r#"C:\Program Files\Toggl Jira\100%\sync.exe"#),
+            Path::new(r#"C:\Users\Me\My Config\100%.toml"#),
+            60,
+        );
+
+        assert_eq!(
+            command,
+            "schtasks /Create /F /SC MINUTE /MO 60 /TN toggl-jira-sync /TR \"\\\"C:\\Program Files\\Toggl Jira\\100%%\\sync.exe\\\" sync --cleanup-deleted --config \\\"C:\\Users\\Me\\My Config\\100%%.toml\\\"\"\r\n"
+        );
     }
 }

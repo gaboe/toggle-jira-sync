@@ -254,7 +254,7 @@ pub fn schedule_status(paths: SharedPaths) -> anyhow::Result<ScheduleCommandStat
     Ok(ScheduleCommandStatus {
         enabled: config.schedule.enabled,
         interval_minutes: config.schedule.interval_minutes,
-        job_installed: job_path.exists(),
+        job_installed: schedule::job_installed()?,
         job_path: job_path.display().to_string(),
     })
 }
@@ -274,9 +274,8 @@ pub fn uninstall_schedule() -> anyhow::Result<()> {
     schedule::uninstall_job()
 }
 
-/// Reinstall the OS job when the config asks for a schedule but the job file is gone
-/// (manual `schedule uninstall`, wiped LaunchAgents, restored machine). Without this the
-/// two can drift apart silently and nothing syncs until the app is opened by hand.
+/// Reconcile the OS job at startup. Returns true only when an enabled job's files were missing;
+/// unchanged jobs are still loaded so disabled timers are re-enabled without a reinstall log.
 /// Only for the real default config; tests and ad-hoc configs use explicit paths and must
 /// not touch the user's scheduler.
 pub fn ensure_schedule_installed(paths: SharedPaths) -> anyhow::Result<bool> {
@@ -286,11 +285,13 @@ pub fn ensure_schedule_installed(paths: SharedPaths) -> anyhow::Result<bool> {
     }
     let config = AppConfig::from_path(&config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
-    if !config.schedule.enabled || schedule::job_path()?.exists() {
+    if !config.schedule.enabled {
+        schedule::uninstall_job()?;
         return Ok(false);
     }
+    let missing = !schedule::job_installed()?;
     schedule::install_default_job(&config_path, config.schedule.interval_minutes)?;
-    Ok(true)
+    Ok(missing)
 }
 
 pub fn update_schedule(paths: SharedPaths, enabled: bool) -> anyhow::Result<ScheduleSnapshot> {
@@ -341,9 +342,8 @@ pub fn save_config_with_credentials(
     // Reconcile the OS hourly job with the saved schedule so config.enabled and the
     // installed launchd/systemd/schtasks job can't drift apart. Only for the real
     // default config; tests and ad-hoc configs use explicit paths and must not touch
-    // the user's scheduler. Best effort: the config and credentials are already on disk,
-    // so reporting failure here would tell the user the save failed when it did not.
-    // `schedule install` and `schedule set` still surface scheduler errors directly.
+    // the user's scheduler. The files are already saved when this fails, so return a
+    // partial-save error that tells the caller exactly what happened.
     if uses_default_config {
         let reconciled = if config.schedule.enabled {
             schedule::install_default_job(&config_path, config.schedule.interval_minutes)
@@ -351,10 +351,7 @@ pub fn save_config_with_credentials(
             schedule::uninstall_job()
         };
         if let Err(error) = reconciled {
-            append_log(&format!(
-                "config saved but scheduler job reconcile failed: {}",
-                crate::format_error_chain(&error)
-            ));
+            return Err(scheduler_reconcile_failure(error));
         }
     }
     Ok(ConfigSnapshot::from_config(
@@ -363,6 +360,13 @@ pub fn save_config_with_credentials(
         &credentials,
         allow_process_env,
     ))
+}
+
+fn scheduler_reconcile_failure(error: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "config was saved but scheduler change failed: {}",
+        crate::format_error_chain(&error)
+    )
 }
 
 pub fn delete_local_data(paths: SharedPaths) -> anyhow::Result<DeleteLocalDataResult> {
@@ -869,6 +873,16 @@ mod tests {
         assert_eq!(saved.jira_sites[0].key, "acme");
         assert_eq!(saved.jira_sites[1].key, "client");
         AppConfig::from_path(config_path).expect("saved config parses");
+    }
+
+    #[test]
+    fn scheduler_reconcile_failure_reports_partial_save() {
+        let error = scheduler_reconcile_failure(anyhow::anyhow!("native removal failed"));
+
+        assert_eq!(
+            error.to_string(),
+            "config was saved but scheduler change failed: native removal failed"
+        );
     }
 
     #[test]
