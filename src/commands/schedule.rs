@@ -101,6 +101,10 @@ pub(crate) fn install_job(
     let path = job_path()?;
     let job_file = render_job_file(executable, config_path, interval_minutes);
     if job_installation_unchanged(&path, &job_file, executable, config_path)? {
+        #[cfg(target_os = "macos")]
+        if macos_job_loaded()? {
+            return Ok(());
+        }
         load_job(&path)?;
         return Ok(());
     }
@@ -159,8 +163,23 @@ pub(crate) fn job_installed() -> anyhow::Result<bool> {
     #[cfg(target_os = "linux")]
     return Ok(linux_job_files_present(timer_path.exists(), service_exists));
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    return Ok(timer_path.exists() && macos_job_loaded()?);
+
+    #[cfg(target_os = "windows")]
     Ok(timer_path.exists())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_job_loaded() -> anyhow::Result<bool> {
+    if env::var_os("TOGGL_JIRA_SYNC_SKIP_SCHEDULER_LOAD").is_some() {
+        return Ok(true);
+    }
+    let output = Command::new("launchctl")
+        .args(["list", MACOS_LABEL])
+        .output()
+        .context("failed to inspect launchd job")?;
+    Ok(output.status.success())
 }
 
 #[cfg(any(target_os = "linux", test))]

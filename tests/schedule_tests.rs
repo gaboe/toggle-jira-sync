@@ -196,6 +196,52 @@ fn startup_removes_existing_job_when_schedule_is_disabled() {
     assert!(String::from_utf8_lossy(&status.stdout).contains("job installed: false"));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn unchanged_loaded_macos_job_is_not_reloaded() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config = temp.path().join("config.toml");
+    write_config(&config);
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir(&bin_dir).expect("bin dir");
+    let launchctl = bin_dir.join("launchctl");
+    fs::write(
+        &launchctl,
+        "#!/bin/sh\necho \"$@\" >> \"$HOME/launchctl.log\"\nexit 0\n",
+    )
+    .expect("launchctl stub");
+    fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755))
+        .expect("launchctl permissions");
+
+    for _ in 0..2 {
+        let output = Command::new(binary())
+            .args([
+                "schedule",
+                "--config",
+                config.to_str().expect("config path utf8"),
+                "install",
+            ])
+            .env("HOME", temp.path())
+            .env("PATH", &bin_dir)
+            .output()
+            .expect("schedule install should run");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let calls = fs::read_to_string(temp.path().join("launchctl.log")).expect("launchctl calls");
+    assert_eq!(calls.lines().collect::<Vec<_>>().len(), 3, "{calls}");
+    assert_eq!(
+        calls.lines().last(),
+        Some("list com.toggl-jira-sync.hourly")
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn schedule_status_requires_linux_timer_and_service() {
