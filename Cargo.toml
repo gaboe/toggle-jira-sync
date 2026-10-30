@@ -9,25 +9,31 @@ readme = "README.md"
 keywords = ["toggl", "jira", "cli", "ratatui", "sync"]
 categories = ["command-line-utilities"]
 exclude = [
-    "*.sqlite",
-    "*.sqlite3",
-    "credentials.env",
-    "*.credentials.env",
-    "AGENTS.md",
-    "Cargo.toml.orig",
-    ".sisyphus/**",
-    ".opencode/**",
+  "*.sqlite",
+  "*.sqlite3",
+  "credentials.env",
+  "*.credentials.env",
+  "AGENTS.md",
+  "Cargo.toml.orig",
+  ".sisyphus/**",
+  ".opencode/**",
 ]
 
 [dependencies]
 anyhow = "1.0.98"
 axum = "0.7.9"
-chrono = { version = "0.4.41", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4.41", default-features = false, features = [
+  "clock",
+  "std",
+] }
 clap = { version = "4.5.38", features = ["derive"] }
 crossterm = "0.28.1"
 futures = "0.3.31"
 ratatui = { version = "0.29.0", features = ["crossterm"] }
-reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.15", default-features = false, features = [
+  "json",
+  "rustls-tls",
+] }
 regex = "1.11.1"
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 serde = { version = "1.0.219", features = ["derive"] }
